@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If you use RoadForge in research or an engineering project, please cite this software."
+title: "RoadForge: A Simulation-to-Model Workbench for Road-Scene Semantic Perception"
+type: software
+authors:
+  - family-names: Jafari
+    given-names: Arvin
+    affiliation: Independent Developer
+version: 0.1.0
+date-released: 2026-11-12
+url: "https://github.com/ArvinNotDev/RoadForge"
+repository-code: "https://github.com/ArvinNotDev/RoadForge"
+license: MIT
+abstract: >-
+  RoadForge is a Windows-first desktop workbench for collecting road-scene RGB
+  data from CARLA, generating YOLOPv2 ONNX teacher pseudo-labels, auditing and
+  preparing semantic-segmentation datasets, fine-tuning YOLO26 semantic models,
+  evaluating checkpoints, and validating ONNX deployment artifacts.
+keywords:
+  - autonomous driving
+  - CARLA
+  - semantic segmentation
+  - pseudo-labeling
+  - dataset curation
+  - YOLO26
+  - ONNX
