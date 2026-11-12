@@ -296,6 +296,7 @@ By default, application-generated files are stored under `roadforge/workspace/` 
 - [Troubleshooting](TROUBLESHOOTING.md)
 - [Contributing](CONTRIBUTING.md)
 - [Suggested GitHub repository metadata](docs/REPOSITORY_METADATA.md)
+- [Publishing to GitHub](docs/PUBLISHING.md)
 - [Third-party notices](THIRD_PARTY_NOTICES.md)
 
 ## References
