@@ -16,7 +16,7 @@ from roadforge.core.splits import prepare_dataset, split_samples
 def make_sample(tmp_path: Path, group: str, index: int, mask_values=None) -> Sample:
     collection = tmp_path / f"collection_{group}"
     image_path = collection / "raw" / "Town01" / "images" / f"frame_{index:04d}.png"
-    mask_path = collection / "labels_yolopv2" / "Town01" / "combined_3class" / f"frame_{index:04d}.png"
+    mask_path = collection / "labels_yolopv2" / "Town01" / "combined_4class" / f"frame_{index:04d}.png"
     image_path.parent.mkdir(parents=True, exist_ok=True)
     mask_path.parent.mkdir(parents=True, exist_ok=True)
     rgb = np.full((12, 20, 3), index, dtype=np.uint8)
@@ -24,6 +24,7 @@ def make_sample(tmp_path: Path, group: str, index: int, mask_values=None) -> Sam
     if mask_values is None:
         mask[4:10, 2:18] = 1
         mask[5, 4:16] = 2
+        mask[7:9, 8:12] = 3
     Image.fromarray(rgb, "RGB").save(image_path)
     Image.fromarray(mask, "L").save(mask_path)
     return Sample(str(image_path), str(mask_path), str(collection), "Town01", group, group, image_path.name, "ClearNoon", "No traffic", f"route-{group}")
@@ -34,8 +35,8 @@ def test_validation_accepts_lossless_combined_mask_and_counts_classes(tmp_path):
     report = validate_samples([sample])
     assert len(report.valid) == 1
     assert not [issue for issue in report.issues if issue.severity == "error"]
-    assert set(report.class_pixels) == {0, 1, 2}
-    assert report.class_images == {0: 1, 1: 1, 2: 1}
+    assert set(report.class_pixels) == {0, 1, 2, 3}
+    assert report.class_images == {0: 1, 1: 1, 2: 1, 3: 1}
 
 
 def test_validation_reports_missing_corrupt_dimension_and_unexpected_ids(tmp_path):
@@ -113,7 +114,10 @@ def test_prepare_copies_data_yaml_and_preserves_source(tmp_path):
     assert result["counts"] == {"train": 1, "val": 1, "test": 1}
     assert Path(result["data_yaml"]).is_file()
     assert "masks_dir: masks" in Path(result["data_yaml"]).read_text(encoding="utf-8")
-    assert "ego_drivable_area" in Path(result["data_yaml"]).read_text(encoding="utf-8")
+    yaml_text = Path(result["data_yaml"]).read_text(encoding="utf-8")
+    assert "ego_drivable_area" in yaml_text
+    assert "vehicles" in yaml_text
+    assert result["report"]["num_classes"] == 4
     assert (Path(result["path"]) / "dataset_report.json").is_file()
     assert all(Path(sample.image).read_bytes() == original_bytes[sample.image] for sample in samples)
 
@@ -135,11 +139,14 @@ def test_config_save_load_and_migration(tmp_path):
     path = tmp_path / "config.json"
     save_config(path, config)
     loaded = load_config(path)
-    assert loaded["config_version"] == 2
+    assert loaded["config_version"] == 3
     assert loaded["dataset"] == {"data_yaml": "", "prepared_dataset": ""}
     assert loaded["export"]["imgsz"] == 512
     assert loaded["model"]["task"] == "semantic"
-    assert loaded["model"]["classes"] == {0: "background", 1: "ego_drivable_area", 2: "lane_lines"}
+    assert loaded["model"]["classes"] == {
+        0: "background", 1: "ego_drivable_area",
+        2: "lane_lines", 3: "vehicles",
+    }
 
 
 def test_validation_report_exports_all_samples_and_issues(tmp_path):
@@ -175,7 +182,8 @@ def test_config_v1_migration_preserves_values_and_adds_new_fields(tmp_path):
     path = tmp_path / "legacy.json"
     path.write_text(json.dumps(legacy), encoding="utf-8")
     loaded = load_config(path)
-    assert loaded["config_version"] == 2
+    assert loaded["config_version"] == 3
+    assert loaded["model"]["classes"][3] == "vehicles"
     assert loaded["training"]["epochs"] == 17
     assert loaded["training"]["batch"] == 2
     assert loaded["split"]["train"] == 0.7
@@ -204,16 +212,16 @@ def test_dataset_manifest_rejects_paths_outside_dataset(tmp_path):
 
 
 def test_semantic_decoder_supports_discrete_batch_map_and_logits_layouts():
-    class_map = np.arange(20, dtype=np.uint8).reshape(4, 5) % 3
+    class_map = np.arange(20, dtype=np.uint8).reshape(4, 5) % 4
     assert np.array_equal(_semantic_array_to_mask(class_map[None, ...]), class_map)
-    nchw = np.stack([class_map == 0, class_map == 1, class_map == 2]).astype(np.float32)
+    nchw = np.stack([class_map == value for value in range(4)]).astype(np.float32)
     assert np.array_equal(_semantic_array_to_mask(nchw), class_map)
     nhwc = np.moveaxis(nchw, 0, -1)
     assert np.array_equal(_semantic_array_to_mask(nhwc), class_map)
     resized = _semantic_array_to_mask(class_map[None, ...], (8, 10))
     assert resized.shape == (8, 10)
-    assert _semantic_array_to_mask(np.array([[[2]]], dtype=np.uint8)).tolist() == [[2]]
-    assert set(np.unique(resized)).issubset({0, 1, 2})
+    assert _semantic_array_to_mask(np.array([[[3]]], dtype=np.uint8)).tolist() == [[3]]
+    assert set(np.unique(resized)).issubset({0, 1, 2, 3})
 
 
 def test_metrics_reject_out_of_range_predictions_instead_of_dropping_pixels():
@@ -298,3 +306,47 @@ def test_ignore_pixels_are_counted_and_class_id_is_preserved_in_manifest(tmp_pat
     assert result["report"]["ignore_label"] == 255
     with pytest.raises(ValueError, match="outside the semantic class IDs"):
         validate_samples([sample], ignore_label=1)
+
+
+def test_legacy_three_class_annotation_is_discovered_but_rejected_for_training(tmp_path):
+    collection = tmp_path / "collection_legacy"
+    image = collection / "raw" / "Town01" / "images" / "old.png"
+    mask = collection / "labels_yolopv2" / "Town01" / "combined_3class" / "old.png"
+    image.parent.mkdir(parents=True)
+    mask.parent.mkdir(parents=True)
+    Image.fromarray(np.zeros((4, 6, 3), dtype=np.uint8), "RGB").save(image)
+    Image.fromarray(np.ones((4, 6), dtype=np.uint8), "L").save(mask)
+    (collection / "collection_manifest.json").write_text(
+        json.dumps({"session_id": "legacy-session", "config": {}}), encoding="utf-8"
+    )
+    (collection / "annotation_manifest.json").write_text(
+        json.dumps({"images": {
+            "raw/Town01/images/old.png": {
+                "status": "success",
+                "original_image": "raw/Town01/images/old.png",
+                "combined_mask": "labels_yolopv2/Town01/combined_3class/old.png",
+            }
+        }}), encoding="utf-8"
+    )
+    found = discover_collections([tmp_path])
+    sample = found[0].samples[0]
+    assert sample.mask == str(mask)
+    report = validate_samples([sample])
+    assert not report.valid
+    assert any(issue.code == "legacy_class_map" for issue in report.issues)
+
+
+def test_config_v2_three_class_upgrade_appends_vehicles(tmp_path):
+    legacy = {
+        "config_version": 2,
+        "project_root": str(tmp_path),
+        "model": {"classes": {0: "background", 1: "ego_drivable_area", 2: "lane_lines"}},
+    }
+    path = tmp_path / "roadforge-v2.json"
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+    loaded = load_config(path)
+    assert loaded["config_version"] == 3
+    assert loaded["model"]["classes"] == {
+        0: "background", 1: "ego_drivable_area",
+        2: "lane_lines", 3: "vehicles",
+    }
