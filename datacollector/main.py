@@ -15,12 +15,14 @@ try:  # Supports both `python main.py` and `python -m datacollector.main`.
     from .config import CAMERA_REFERENCE, TOWNS
     from .worker import CarlaWorker
     from .teacher_labeling import (AnnotationWorker, CollectionScanWorker, YOLOPv2Predictor, create_session,
-        visualization)
+        DEFAULT_VEHICLE_SCORE_THRESHOLD, DEFAULT_VEHICLE_NMS_THRESHOLD,
+        DEFAULT_VEHICLE_BOTTOM_KEEP_RATIO, visualization)
 except ImportError:
     from config import CAMERA_REFERENCE, TOWNS
     from worker import CarlaWorker
     from teacher_labeling import (AnnotationWorker, CollectionScanWorker, YOLOPv2Predictor, create_session,
-        visualization)
+        DEFAULT_VEHICLE_SCORE_THRESHOLD, DEFAULT_VEHICLE_NMS_THRESHOLD,
+        DEFAULT_VEHICLE_BOTTOM_KEEP_RATIO, visualization)
 
 
 class MainWindow(QMainWindow):
@@ -151,8 +153,8 @@ class MainWindow(QMainWindow):
         vf = QGridLayout(vehicle_box)
         self.annotate_vehicles = QCheckBox("Detect vehicles and add the semantic vehicles class")
         self.annotate_vehicles.setChecked(True)
-        self.vehicle_confidence = self._dspin(0.01, 0.99, 0.30, 0.01)
-        self.vehicle_nms = self._dspin(0.01, 0.99, 0.45, 0.01)
+        self.vehicle_confidence = self._dspin(0.01, 0.99, DEFAULT_VEHICLE_SCORE_THRESHOLD, 0.01)
+        self.vehicle_nms = self._dspin(0.01, 0.99, DEFAULT_VEHICLE_NMS_THRESHOLD, 0.01)
         self.vehicle_mask_method = QComboBox()
         self.vehicle_mask_method.addItem("GrabCut silhouette (recommended)", "grabcut")
         self.vehicle_mask_method.addItem("Bounding boxes (coarse)", "box")
@@ -160,8 +162,10 @@ class MainWindow(QMainWindow):
         vf.addWidget(QLabel("Detection confidence"), 1, 0); vf.addWidget(self.vehicle_confidence, 1, 1)
         vf.addWidget(QLabel("NMS IoU"), 1, 2); vf.addWidget(self.vehicle_nms, 1, 3)
         vf.addWidget(QLabel("Vehicle mask extraction"), 2, 0); vf.addWidget(self.vehicle_mask_method, 2, 1, 1, 3)
+        excluded_bottom_percent = round((1.0 - DEFAULT_VEHICLE_BOTTOM_KEEP_RATIO) * 100)
         vehicle_hint = QLabel("COCO car / motorcycle / bus / truck detections are merged into one class. "
-                              "GrabCut attempts a foreground silhouette inside each YOLOPv2 box; "
+                              f"The bottom {excluded_bottom_percent}% of the image is excluded from vehicle detections to suppress the ego hood; "
+                              "boxes crossing that boundary are clipped. GrabCut attempts a foreground silhouette inside each YOLOPv2 box; "
                               "failed instances fall back to a coarse box and are counted in the manifest.")
         vehicle_hint.setWordWrap(True); vehicle_hint.setObjectName("muted")
         vf.addWidget(vehicle_hint, 3, 0, 1, 4)
