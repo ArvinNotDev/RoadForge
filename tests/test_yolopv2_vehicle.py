@@ -105,3 +105,43 @@ def test_grabcut_small_vehicle_box_uses_reported_box_fallback():
     assert fallbacks == 1
     assert int(vehicle.sum()) > 0
     assert set(np.unique(vehicle)).issubset({0, 255})
+
+
+def test_four_class_annotation_validator_accepts_vehicle_lane_overlap(tmp_path):
+    teacher = _teacher_module()
+    cv2 = __import__("cv2")
+    height, width = 16, 20
+    drive = np.zeros((height, width), dtype=np.uint8)
+    lane = np.zeros_like(drive)
+    vehicle = np.zeros_like(drive)
+    combined = np.zeros_like(drive)
+
+    drive[4:12, 3:17] = 255
+    lane[7:9, 3:17] = 255
+    vehicle[5:11, 8:14] = 255
+    combined[drive > 0] = 1
+    combined[lane > 0] = 2
+    combined[vehicle > 0] = 3
+
+    files = {
+        "drivable_mask": "drivable.png",
+        "lane_mask": "lane.png",
+        "vehicle_mask": "vehicles.png",
+        "combined_mask": "combined.png",
+    }
+    for key, name in files.items():
+        mask = {
+            "drivable_mask": drive,
+            "lane_mask": lane,
+            "vehicle_mask": vehicle,
+            "combined_mask": combined,
+        }[key]
+        assert cv2.imwrite(str(tmp_path / name), mask)
+
+    record = {
+        **files,
+        "width": width,
+        "height": height,
+        "class_map": {"0": "background", "1": "ego_drivable_area", "2": "lane_lines", "3": "vehicles"},
+    }
+    assert teacher.annotation_outputs_valid(tmp_path, record)
