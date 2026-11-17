@@ -6,7 +6,7 @@ import numpy as np
 def confusion_matrix(
     target: np.ndarray,
     prediction: np.ndarray,
-    num_classes: int = 3,
+    num_classes: int = 4,
     ignore_label: int | None = None,
 ) -> np.ndarray:
     if num_classes < 1:
