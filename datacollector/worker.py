@@ -2,7 +2,6 @@
 import json
 import queue
 import random
-from collections import OrderedDict
 import threading
 import time
 import traceback
@@ -47,9 +46,11 @@ class CarlaWorker(QThread):
         self._carla_server_version = None
         self._carla_module_path = None
         self._images = queue.Queue(maxsize=64)
-        self._snapshot_history = OrderedDict()
-        self._pending_camera_packets = {}
-        self._last_processed_camera_frame = -1
+        try:
+            from .camera_sync import CameraFrameSynchronizer
+        except ImportError:
+            from camera_sync import CameraFrameSynchronizer
+        self._camera_frames = CameraFrameSynchronizer()
         self._camera_no_data_since = None
         self._last_camera_wait_log = 0.0
         self._owned_vehicles = []
@@ -352,9 +353,7 @@ class CarlaWorker(QThread):
             tf = carla.Transform(carla.Location(x=float(camera_cfg["x"]),y=float(camera_cfg["y"]),z=float(camera_cfg["z"])),carla.Rotation(pitch=float(camera_cfg["pitch"]),yaw=float(camera_cfg["yaw"]),roll=float(camera_cfg["roll"])))
             self.camera = self.world.spawn_actor(bp, tf, attach_to=actor)
             self._wait_for_actor_snapshot(self.camera, "RGB camera")
-            self._snapshot_history.clear()
-            self._pending_camera_packets.clear()
-            self._last_processed_camera_frame = -1
+            self._camera_frames.reset()
             self._camera_no_data_since = time.monotonic()
             self._last_camera_wait_log = 0.0
             self.camera.listen(self._camera_callback)
@@ -390,10 +389,7 @@ class CarlaWorker(QThread):
         if snapshot is None:
             raise RuntimeError("CARLA returned no WorldSnapshot after a successful world.tick().")
         frame_number = int(snapshot.frame)
-        self._snapshot_history[frame_number] = snapshot
-        self._snapshot_history.move_to_end(frame_number)
-        while len(self._snapshot_history) > 128:
-            self._snapshot_history.popitem(last=False)
+        self._camera_frames.add_snapshot(snapshot)
         return snapshot
 
     def _wait_for_actor_snapshot(self, actor, label, max_ticks=5):
@@ -415,34 +411,13 @@ class CarlaWorker(QThread):
                 packet = self._images.get_nowait()
             except queue.Empty:
                 break
-            frame_number = int(packet["frame"])
-            if frame_number > self._last_processed_camera_frame:
-                self._pending_camera_packets[frame_number] = packet
+            self._camera_frames.add_packet(packet)
 
-        ready = []
-        oldest_snapshot = next(iter(self._snapshot_history), None)
-        for frame_number in sorted(tuple(self._pending_camera_packets)):
-            packet = self._pending_camera_packets[frame_number]
-            snapshot = self._snapshot_history.get(frame_number)
-            if snapshot is not None:
-                ready.append((packet, snapshot))
-                self._pending_camera_packets.pop(frame_number, None)
-                self._last_processed_camera_frame = max(
-                    self._last_processed_camera_frame, frame_number
-                )
-            elif oldest_snapshot is not None and frame_number < oldest_snapshot:
-                self._pending_camera_packets.pop(frame_number, None)
-                self.log.emit(
-                    f"Discarded camera frame {frame_number}: its world snapshot is no longer cached."
-                )
-
-        while len(self._pending_camera_packets) > 64:
-            oldest_frame = min(self._pending_camera_packets)
-            self._pending_camera_packets.pop(oldest_frame, None)
-            self.log.emit(
-                f"Discarded delayed camera frame {oldest_frame}: the sensor queue exceeded its safety buffer."
-            )
-        return ready
+        ready = self._camera_frames.drain_ready()
+        if ready:
+            return ready
+        # Report packets discarded because their matching snapshot aged out.
+        return []
 
     def _check_camera_delivery(self, world_frame):
         """Keep ticking through normal GPU latency, but fail clearly if no image arrives."""
@@ -499,9 +474,7 @@ class CarlaWorker(QThread):
         while True:
             try: self._images.get_nowait()
             except queue.Empty: break
-        self._pending_camera_packets.clear()
-        self._snapshot_history.clear()
-        self._last_processed_camera_frame = -1
+        self._camera_frames.reset()
         self._camera_no_data_since = None
         self._last_camera_wait_log = 0.0
 
