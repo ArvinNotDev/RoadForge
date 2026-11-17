@@ -101,8 +101,11 @@ def annotation_outputs_valid(collection, record):
             and set(np.unique(lane)).issubset({0, 255})
             and set(np.unique(vehicle)).issubset({0, 255})
             and set(np.unique(combined)).issubset({0, 1, 2, 3})
-            and bool(np.all(combined[lane > 0] == 2))
+            # Vehicle class 3 intentionally overrides lane class 2 and drivable
+            # class 1 where detected boxes overlap those regions.
+            and bool(np.all(combined[(lane > 0) & (vehicle == 0)] == 2))
             and bool(np.all(combined[vehicle > 0] == 3))
+            and bool(np.all(combined[(drive > 0) & (lane == 0) & (vehicle == 0)] == 1))
             and record.get("class_map", {}).get("3") == "vehicles"
         )
     except (KeyError, TypeError, ValueError, OSError, AttributeError):
