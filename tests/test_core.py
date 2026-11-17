@@ -212,14 +212,14 @@ def test_dataset_manifest_rejects_paths_outside_dataset(tmp_path):
 
 
 def test_semantic_decoder_supports_discrete_batch_map_and_logits_layouts():
-    class_map = np.arange(20, dtype=np.uint8).reshape(4, 5) % 4
+    class_map = np.arange(42, dtype=np.uint8).reshape(6, 7) % 4
     assert np.array_equal(_semantic_array_to_mask(class_map[None, ...]), class_map)
     nchw = np.stack([class_map == value for value in range(4)]).astype(np.float32)
     assert np.array_equal(_semantic_array_to_mask(nchw), class_map)
     nhwc = np.moveaxis(nchw, 0, -1)
     assert np.array_equal(_semantic_array_to_mask(nhwc), class_map)
-    resized = _semantic_array_to_mask(class_map[None, ...], (8, 10))
-    assert resized.shape == (8, 10)
+    resized = _semantic_array_to_mask(class_map[None, ...], (12, 14))
+    assert resized.shape == (12, 14)
     assert _semantic_array_to_mask(np.array([[[3]]], dtype=np.uint8)).tolist() == [[3]]
     assert set(np.unique(resized)).issubset({0, 1, 2, 3})
 
