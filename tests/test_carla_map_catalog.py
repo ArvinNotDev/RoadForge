@@ -6,6 +6,7 @@ from datacollector.map_catalog import (
     normalize_map_name,
     require_map_reference,
     validate_selected_map_names,
+    select_collection_towns,
 )
 
 
@@ -64,3 +65,51 @@ def test_duplicate_display_names_with_different_references_are_rejected():
             "/Game/Carla/Maps/Town12",
             "/AnotherPackage/Town12",
         ])
+
+
+
+def test_current_world_mode_uses_only_the_loaded_town():
+    selected = select_collection_towns(
+        {
+            "Town10HD_Opt": {"enabled": True, "target": 100},
+            "Town12": {"enabled": True, "target": 200},
+        },
+        {
+            "Town10HD_Opt": "/Game/Carla/Maps/Town10HD_Opt",
+            "Town12": "/Game/Carla/Maps/Town12",
+        },
+        use_current_world=True,
+        current_map_reference="/Game/Carla/Maps/Town10HD_Opt",
+    )
+
+    assert selected == ["Town10HD_Opt"]
+
+
+def test_current_world_mode_requires_current_town_to_be_enabled():
+    with pytest.raises(ValueError, match="Enable the currently loaded map"):
+        select_collection_towns(
+            {"Town12": {"enabled": False, "target": 100}},
+            {"Town12": "/Game/Carla/Maps/Town12"},
+            use_current_world=True,
+            current_map_reference="/Game/Carla/Maps/Town12",
+        )
+
+
+def test_current_world_mode_requires_positive_target():
+    with pytest.raises(ValueError, match="positive image target"):
+        select_collection_towns(
+            {"Town12": {"enabled": True, "target": 0}},
+            {"Town12": "/Game/Carla/Maps/Town12"},
+            use_current_world=True,
+            current_map_reference="/Game/Carla/Maps/Town12",
+        )
+
+
+def test_current_world_mode_rejects_unknown_current_map():
+    with pytest.raises(ValueError, match="was not discovered"):
+        select_collection_towns(
+            {"Town12": {"enabled": True, "target": 100}},
+            {"Town10HD_Opt": "/Game/Carla/Maps/Town10HD_Opt"},
+            use_current_world=True,
+            current_map_reference="/Game/Carla/Maps/Town12",
+        )

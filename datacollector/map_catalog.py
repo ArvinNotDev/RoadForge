@@ -52,3 +52,48 @@ def require_map_reference(map_name, map_references):
             f"CARLA map '{map_name}' was not discovered on the connected server. "
             "Reconnect and select an installed map."
         ) from None
+
+
+
+def select_collection_towns(
+    town_specs,
+    map_references,
+    *,
+    use_current_world=False,
+    current_map_reference=None,
+):
+    """Resolve the collection targets, optionally restricting capture to get_world()."""
+    town_specs = town_specs or {}
+    if use_current_world:
+        current_town = normalize_map_name(current_map_reference)
+        if not current_town:
+            raise ValueError(
+                "Could not identify the currently loaded CARLA map from client.get_world()."
+            )
+        if current_town not in map_references:
+            raise ValueError(
+                f"The currently loaded CARLA map '{current_town}' was not discovered by the server. "
+                "Reconnect to refresh the installed map list."
+            )
+        spec = town_specs.get(current_town)
+        if not isinstance(spec, dict) or not bool(spec.get("enabled", False)):
+            raise ValueError(
+                f"Enable the currently loaded map '{current_town}' in the map targets before collecting."
+            )
+        try:
+            target = int(spec.get("target", 0))
+        except (TypeError, ValueError):
+            target = 0
+        if target <= 0:
+            raise ValueError(
+                f"Set a positive image target for the currently loaded map '{current_town}'."
+            )
+        return [current_town]
+
+    selected = [
+        name for name, spec in town_specs.items()
+        if spec.get("enabled") and int(spec.get("target", 0)) > 0
+    ]
+    if not selected:
+        raise ValueError("Select at least one installed CARLA map with a positive target")
+    return validate_selected_map_names(selected, map_references)

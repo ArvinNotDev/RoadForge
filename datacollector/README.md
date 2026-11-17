@@ -46,3 +46,17 @@ For the complete workflow, mask schema, teacher graph assumptions, and scientifi
 The YOLOPv2 Teacher Labeling tab uses outputs 0–3 of the existing six-output ONNX model to detect COCO cars, motorcycles, buses, and trucks. Those detections are merged into semantic class 3, `vehicles`. GrabCut is the default silhouette estimator; the box mode is an explicitly coarse alternative, and GrabCut failures fall back to the detector box with a count in the annotation manifest. The confidence, NMS threshold, class selection, and extraction mode are recorded per image. Vehicle detection defaults to 0.50 confidence and 0.40 NMS IoU. The bottom 22% of the image is excluded from vehicle detections to suppress the ego-vehicle hood; boxes crossing the cutoff are clipped at the boundary. The settings are recorded per image.
 
 When an existing collection has three-class labels, rescanning marks those annotations as outdated for the current four-class schema. Running annotation creates `vehicle_masks` and `combined_4class` files without deleting the original `combined_3class` masks.
+
+
+## Current-world collection and synchronous camera capture
+
+The collector offers **Use currently loaded world (get_world)**. Enable it to collect only
+the connected town without calling `load_world()` or replacing the current simulation world.
+The current town must remain enabled in the target list and have a positive image target.
+
+CARLA 1.0 camera frames may arrive a few simulation frames after the world tick that
+generated them. RoadForge therefore keeps a bounded history of world snapshots, advances
+the synchronous simulation continuously, and pairs each RGB frame with the snapshot for
+the same CARLA frame ID. It does not block waiting for the camera frame matching the
+most recent tick. Newly spawned Ego and camera actors are also confirmed in a world
+snapshot before the collection loop starts.

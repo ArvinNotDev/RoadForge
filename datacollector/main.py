@@ -70,8 +70,18 @@ class MainWindow(QMainWindow):
         self.host=QLineEdit("127.0.0.1"); self.port=self._spin(1,65535,2000)
         self.timeout=self._dspin(1,180,20,1)
         self.current_town=QLabel("—"); self.connect_btn=QPushButton("Connect"); self.connect_btn.clicked.connect(self.connect)
+        self.use_current_world = QCheckBox("Use currently loaded world (get_world)")
+        self.use_current_world.setToolTip(
+            "Collect only from the city already loaded in CARLA. RoadForge will skip load_world() "
+            "and will not replace the current world."
+        )
+        current_world_hint = QLabel(
+            "When enabled, only the current town's target is used; no map is loaded or switched."
+        )
+        current_world_hint.setWordWrap(True); current_world_hint.setObjectName("muted")
         hostrow=QHBoxLayout(); hostrow.addWidget(self.host,3); hostrow.addWidget(QLabel("Port")); hostrow.addWidget(self.port,1)
-        form.addRow("Host",hostrow); form.addRow("Timeout (s)",self.timeout); form.addRow("Current town",self.current_town); form.addRow(self.connect_btn)
+        form.addRow("Host",hostrow); form.addRow("Timeout (s)",self.timeout); form.addRow("Current town",self.current_town)
+        form.addRow(self.use_current_world); form.addRow(current_world_hint); form.addRow(self.connect_btn)
         left.addWidget(conn)
 
         towns=QGroupBox("Installed CARLA maps · targets")
@@ -567,7 +577,8 @@ class MainWindow(QMainWindow):
             "towns":{t:{"enabled":r["enabled"].isChecked(),"target":r["target"].value()} for t,r in self.town_rows.items()},
             "capture_interval":self.interval.value(),"images_per_spawn":self.images_per_spawn.value(),"vehicle_blueprint":self.vehicle.text().strip(),
             "tm_speed_difference":self.speed.value(),"background_traffic":self.traffic.isChecked(),"background_vehicle_count":self.traffic_count.value(),
-            "weather":self.weather.currentText(),"output_directory":self.output.text().strip(),"camera":camera}
+            "weather":self.weather.currentText(),"output_directory":self.output.text().strip(),"camera":camera,
+            "use_current_world":self.use_current_world.isChecked()}
 
     def _check_camera(self):
         is_ref=all(abs(self.camera_fields[k].value()-v)<1e-6 for k,v in CAMERA_REFERENCE.items() if k in self.camera_fields)
@@ -622,12 +633,27 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "CARLA connection", "Wait for the current CARLA operation to finish.")
             return
         config = self._config()
-        selected = [
-            name for name, spec in config["towns"].items()
-            if spec["enabled"] and int(spec["target"]) > 0
-        ]
+        if config.get("use_current_world"):
+            current_town = self.current_town.text().strip()
+            current_spec = config["towns"].get(current_town)
+            selected = (
+                [current_town]
+                if current_spec and current_spec["enabled"] and int(current_spec["target"]) > 0
+                else []
+            )
+        else:
+            selected = [
+                name for name, spec in config["towns"].items()
+                if spec["enabled"] and int(spec["target"]) > 0
+            ]
         if not selected:
-            QMessageBox.warning(self, "No maps selected", "Select at least one installed map with a positive target.")
+            message = (
+                f"Enable the currently loaded map '{self.current_town.text().strip()}' "
+                "and set a positive target for it."
+                if config.get("use_current_world")
+                else "Select at least one installed map with a positive target."
+            )
+            QMessageBox.warning(self, "No maps selected", message)
             return
         unavailable = sorted(set(selected) - self._available_map_names)
         if unavailable:
@@ -637,10 +663,17 @@ class MainWindow(QMainWindow):
                 + ", ".join(unavailable) + ". Reconnect to refresh the map selector."
             )
             return
-        QMessageBox.information(
-            self, "World loading",
-            "Collection loads each selected map. CARLA's currently loaded world will be replaced as the map changes."
-        )
+        if config.get("use_current_world"):
+            QMessageBox.information(
+                self, "Current world",
+                "RoadForge will reuse the currently loaded CARLA world through client.get_world(). "
+                "It will not call load_world() or replace the current map. Only this town's target will be collected."
+            )
+        else:
+            QMessageBox.information(
+                self, "World loading",
+                "Collection loads each selected map. CARLA's currently loaded world will be replaced as the map changes."
+            )
         self._collection_running = True
         self._update_collection_availability()
         self.pause_btn.setEnabled(True)

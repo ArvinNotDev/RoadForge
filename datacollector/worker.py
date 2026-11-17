@@ -2,6 +2,7 @@
 import json
 import queue
 import random
+from collections import OrderedDict
 import threading
 import time
 import traceback
@@ -11,11 +12,17 @@ from PySide6.QtCore import QThread, Signal
 
 try:
     from .carla_compat import sticky_control_error_message, version_mismatch_message
-    from .map_catalog import build_map_reference_index, normalize_map_name, require_map_reference, validate_selected_map_names
+    from .map_catalog import (
+        build_map_reference_index, normalize_map_name, require_map_reference,
+        select_collection_towns,
+    )
     from .storage import DatasetStore
 except ImportError:
     from carla_compat import sticky_control_error_message, version_mismatch_message
-    from map_catalog import build_map_reference_index, normalize_map_name, require_map_reference, validate_selected_map_names
+    from map_catalog import (
+        build_map_reference_index, normalize_map_name, require_map_reference,
+        select_collection_towns,
+    )
     from storage import DatasetStore
 
 
@@ -39,7 +46,12 @@ class CarlaWorker(QThread):
         self._carla_client_version = None
         self._carla_server_version = None
         self._carla_module_path = None
-        self._images = queue.Queue(maxsize=8)
+        self._images = queue.Queue(maxsize=64)
+        self._snapshot_history = OrderedDict()
+        self._pending_camera_packets = {}
+        self._last_processed_camera_frame = -1
+        self._camera_no_data_since = None
+        self._last_camera_wait_log = 0.0
         self._owned_vehicles = []
         self._owned_walkers = []
         self._saved_world_settings = None
@@ -103,6 +115,10 @@ class CarlaWorker(QThread):
             self.log.emit(
                 "This CARLA API does not expose get_available_maps(); only the currently loaded map is available."
             )
+        # The active world is authoritative even if a custom/package map was omitted
+        # from get_available_maps() by the server build.
+        if current_town and current_map_reference:
+            self._map_refs.setdefault(current_town, current_map_reference)
         self.maps_available.emit(sorted(self._map_refs))
         self.log.emit(
             f"CARLA server reports {len(self._map_refs)} available map(s): "
@@ -128,10 +144,16 @@ class CarlaWorker(QThread):
 
     def _collect(self):
         from datetime import datetime
-        selected = [name for name, spec in self.config["towns"].items() if spec["enabled"] and int(spec["target"]) > 0]
-        if not selected:
-            raise ValueError("Select at least one installed CARLA map with a positive target")
-        selected = validate_selected_map_names(selected, self._map_refs)
+        use_current_world = bool(self.config.get("use_current_world", False))
+        current_map_reference = (
+            str(self.world.get_map().name).strip() if use_current_world else None
+        )
+        selected = select_collection_towns(
+            self.config.get("towns", {}),
+            self._map_refs,
+            use_current_world=use_current_world,
+            current_map_reference=current_map_reference,
+        )
         store = DatasetStore(self.config["output_directory"], self.config)
         counts = {town: store.existing_count(town) for town in selected}
         targets = {town: int(self.config["towns"][town]["target"]) for town in selected}
@@ -148,7 +170,19 @@ class CarlaWorker(QThread):
             if self._stop.is_set(): break
             if counts[town] >= targets[town]:
                 continue
-            self._load_town(town)
+            if use_current_world:
+                live_reference = str(self.world.get_map().name).strip()
+                live_town = normalize_map_name(live_reference)
+                if live_town != town:
+                    raise RuntimeError(
+                        f"CARLA's current world changed from '{town}' to '{live_town}' before collection started."
+                    )
+                self.log.emit(
+                    f"Reusing current world from client.get_world(): {live_reference} · load_world() skipped"
+                )
+                self._say(f"Using current world · {town} · load_world() skipped")
+            else:
+                self._load_town(town)
             self._configure_world()
             self._configure_weather()
             self._spawn_traffic()
@@ -174,45 +208,57 @@ class CarlaWorker(QThread):
                         if self._stop.is_set(): break
                         self._say("Resumed")
                         pause_announced = False
-                    frame_id = self.world.tick()
-                    snapshot = self.world.get_snapshot()
-                    timestamp = snapshot.timestamp.elapsed_seconds
-                    frame = self._wait_image(frame_id, 3.0)
-                    if frame is None:
-                        self._failed += 1
-                        self.log.emit(f"No camera frame for CARLA frame {snapshot.frame}")
+                    snapshot = self._tick_world()
+                    ready_frames = self._drain_ready_images()
+                    if not ready_frames:
+                        self._check_camera_delivery(snapshot.frame)
                         continue
-                    if self._next_capture is None:
-                        self._next_capture = timestamp
-                    if timestamp + 1e-6 < self._next_capture:
-                        continue
-                    try:
-                        rgb = frame["bgra"][:, :, :3][:, :, ::-1].copy()
-                        vehicle_tf = self.vehicle.get_transform()
-                        camera = self.config["camera"]
-                        pose = vehicle_tf
-                        metadata = {
-                            "carla_frame": frame["frame"], "simulation_timestamp": timestamp,
-                            "simulation_delta_since_capture": None if last_timestamp is None else timestamp-last_timestamp,
-                            "ego_transform": {"location": {"x":pose.location.x,"y":pose.location.y,"z":pose.location.z}, "rotation": {"pitch":pose.rotation.pitch,"yaw":pose.rotation.yaw,"roll":pose.rotation.roll}},
-                            "spawn_point_id": index, "camera_resolution": [camera["width"],camera["height"]],
-                            "camera_fov": camera["fov"], "camera_transform": {k:camera[k] for k in ("x","y","z","pitch","yaw","roll")},
-                            "weather": self.config["weather"], "vehicle_blueprint": self.config["vehicle_blueprint"],
-                            "carla_map_reference": self._map_refs.get(town, town),
-                            "traffic_manager": {"port": self.tm.get_port(), "speed_difference_percent": self.config["tm_speed_difference"]},
-                            "town_target": targets[town], "town_count": counts[town]+1,
-                        }
-                        saved_path = store.save(town, rgb, metadata)
-                        counts[town] += 1; images_here += 1; self._capture_count += 1
-                        last_timestamp = timestamp
-                        self.preview.emit(rgb)
-                        self._emit_progress(town, index, timestamp)
-                        if counts[town] % 25 == 0 or counts[town] == targets[town]:
-                            self.log.emit(f"{town}: {counts[town]}/{targets[town]} saved ({saved_path})")
-                    except Exception as exc:
-                        self._failed += 1
-                        self.log.emit(f"Image save failed: {exc}")
-                    self._next_capture += float(self.config["capture_interval"])
+                    self._camera_no_data_since = None
+                    self._last_camera_wait_log = 0.0
+                    for frame, frame_snapshot in ready_frames:
+                        if (
+                            images_here >= int(self.config["images_per_spawn"])
+                            or counts[town] >= targets[town]
+                            or self._stop.is_set()
+                        ):
+                            break
+                        timestamp = float(frame["timestamp"])
+                        if self._next_capture is None:
+                            self._next_capture = timestamp
+                        if timestamp + 1e-6 < self._next_capture:
+                            continue
+                        actor_snapshot = frame_snapshot.find(int(self.vehicle.id))
+                        if actor_snapshot is None:
+                            self.log.emit(
+                                f"Camera frame {frame['frame']} has no matching Ego snapshot; skipping that frame."
+                            )
+                            continue
+                        try:
+                            rgb = frame["bgra"][:, :, :3][:, :, ::-1].copy()
+                            pose = actor_snapshot.get_transform()
+                            camera = self.config["camera"]
+                            metadata = {
+                                "carla_frame": frame["frame"], "simulation_timestamp": timestamp,
+                                "simulation_delta_since_capture": None if last_timestamp is None else timestamp-last_timestamp,
+                                "ego_transform": {"location": {"x":pose.location.x,"y":pose.location.y,"z":pose.location.z}, "rotation": {"pitch":pose.rotation.pitch,"yaw":pose.rotation.yaw,"roll":pose.rotation.roll}},
+                                "spawn_point_id": index, "camera_resolution": [camera["width"],camera["height"]],
+                                "camera_fov": camera["fov"], "camera_transform": {k:camera[k] for k in ("x","y","z","pitch","yaw","roll")},
+                                "weather": self.config["weather"], "vehicle_blueprint": self.config["vehicle_blueprint"],
+                                "carla_map_reference": self._map_refs.get(town, town),
+                                "traffic_manager": {"port": self.tm.get_port(), "speed_difference_percent": self.config["tm_speed_difference"]},
+                                "town_target": targets[town], "town_count": counts[town]+1,
+                            }
+                            saved_path = store.save(town, rgb, metadata)
+                            counts[town] += 1; images_here += 1; self._capture_count += 1
+                            last_timestamp = timestamp
+                            self.preview.emit(rgb)
+                            self._emit_progress(town, index, timestamp)
+                            if counts[town] % 25 == 0 or counts[town] == targets[town]:
+                                self.log.emit(f"{town}: {counts[town]}/{targets[town]} saved ({saved_path})")
+                        except Exception as exc:
+                            self._failed += 1
+                            self.log.emit(f"Image save failed: {exc}")
+                        self._next_capture += float(self.config["capture_interval"])
                 self._destroy_ego()
             self._destroy_traffic()
         self._say("All selected town targets reached" if not self._stop.is_set() else "Collection stopped")
@@ -247,6 +293,11 @@ class CarlaWorker(QThread):
         self.tm = self.client.get_trafficmanager()
         self.tm.set_synchronous_mode(True)
         self.tm.set_random_device_seed(random.randrange(1, 2**30))
+        self.log.emit(
+            "Synchronous capture enabled · RoadForge owns world.tick(). Close other clients/scripts "
+            "that also tick this CARLA server while collection is running."
+        )
+        self.log.emit(f"Traffic Manager synchronous mode enabled on port {self.tm.get_port()}.")
 
     def _configure_weather(self):
         preset = self.config.get("weather", "Default")
@@ -289,6 +340,9 @@ class CarlaWorker(QThread):
             actor = self.world.try_spawn_actor(blueprint, points[i])
             if actor is None: continue
             self.vehicle = actor; used.add(i)
+            # CARLA 1.0 actor creation is reflected in snapshots on a subsequent
+            # simulation frame. Do not attach controls/sensors before that frame.
+            self._wait_for_actor_snapshot(actor, "Ego vehicle")
             actor.set_autopilot(True, self.tm.get_port())
             self.tm.vehicle_percentage_speed_difference(actor, float(self.config["tm_speed_difference"]))
             camera_cfg = self.config["camera"]
@@ -297,10 +351,117 @@ class CarlaWorker(QThread):
                 bp.set_attribute(attr, str(camera_cfg[key]))
             tf = carla.Transform(carla.Location(x=float(camera_cfg["x"]),y=float(camera_cfg["y"]),z=float(camera_cfg["z"])),carla.Rotation(pitch=float(camera_cfg["pitch"]),yaw=float(camera_cfg["yaw"]),roll=float(camera_cfg["roll"])))
             self.camera = self.world.spawn_actor(bp, tf, attach_to=actor)
+            self._wait_for_actor_snapshot(self.camera, "RGB camera")
+            self._snapshot_history.clear()
+            self._pending_camera_packets.clear()
+            self._last_processed_camera_frame = -1
+            self._camera_no_data_since = time.monotonic()
+            self._last_camera_wait_log = 0.0
             self.camera.listen(self._camera_callback)
-            self._say(f"Ego autopilot active · spawn point {i}")
+            self.log.emit(
+                "RGB camera listener attached. Camera frames are buffered by CARLA frame ID; "
+                "GPU rendering latency will not block the next world tick."
+            )
+            for warmup_index in range(3):
+                warmup_snapshot = self._tick_world()
+                self.log.emit(
+                    f"RGB camera warm-up {warmup_index + 1}/3 · CARLA frame {warmup_snapshot.frame}"
+                )
+            self._say(f"Ego autopilot active · spawn point {i} · RGB camera ready")
             return i
         return None
+
+    def _tick_world(self):
+        """Advance one synchronous frame with a bounded wait and cache its snapshot."""
+        if self.world is None:
+            raise RuntimeError("Cannot tick CARLA because no world is connected.")
+        tick_timeout = max(1.0, min(float(self.config.get("timeout", 20.0)), 10.0))
+        try:
+            self.world.tick(tick_timeout)
+            snapshot = self.world.get_snapshot()
+        except Exception as exc:
+            raise RuntimeError(
+                f"CARLA did not complete a synchronous world.tick() within {tick_timeout:.1f}s. "
+                "RoadForge must be the only client advancing this server during collection. "
+                "Close other Python clients, ScenarioRunner instances, or tools that call world.tick(), "
+                "and make sure a second Traffic Manager is not running in synchronous mode. "
+                f"Original CARLA error: {exc}"
+            ) from exc
+        if snapshot is None:
+            raise RuntimeError("CARLA returned no WorldSnapshot after a successful world.tick().")
+        frame_number = int(snapshot.frame)
+        self._snapshot_history[frame_number] = snapshot
+        self._snapshot_history.move_to_end(frame_number)
+        while len(self._snapshot_history) > 128:
+            self._snapshot_history.popitem(last=False)
+        return snapshot
+
+    def _wait_for_actor_snapshot(self, actor, label, max_ticks=5):
+        """Wait until CARLA 1.0 publishes a newly spawned actor in a world snapshot."""
+        actor_id = int(actor.id)
+        for _ in range(max_ticks):
+            snapshot = self._tick_world()
+            if snapshot.find(actor_id) is not None:
+                return snapshot
+        raise RuntimeError(
+            f"{label} (actor {actor_id}) was spawned, but did not appear in a CARLA WorldSnapshot "
+            f"after {max_ticks} synchronous ticks."
+        )
+
+    def _drain_ready_images(self):
+        """Return camera packets only when their exact frame snapshot is cached."""
+        while True:
+            try:
+                packet = self._images.get_nowait()
+            except queue.Empty:
+                break
+            frame_number = int(packet["frame"])
+            if frame_number > self._last_processed_camera_frame:
+                self._pending_camera_packets[frame_number] = packet
+
+        ready = []
+        oldest_snapshot = next(iter(self._snapshot_history), None)
+        for frame_number in sorted(tuple(self._pending_camera_packets)):
+            packet = self._pending_camera_packets[frame_number]
+            snapshot = self._snapshot_history.get(frame_number)
+            if snapshot is not None:
+                ready.append((packet, snapshot))
+                self._pending_camera_packets.pop(frame_number, None)
+                self._last_processed_camera_frame = max(
+                    self._last_processed_camera_frame, frame_number
+                )
+            elif oldest_snapshot is not None and frame_number < oldest_snapshot:
+                self._pending_camera_packets.pop(frame_number, None)
+                self.log.emit(
+                    f"Discarded camera frame {frame_number}: its world snapshot is no longer cached."
+                )
+
+        while len(self._pending_camera_packets) > 64:
+            oldest_frame = min(self._pending_camera_packets)
+            self._pending_camera_packets.pop(oldest_frame, None)
+            self.log.emit(
+                f"Discarded delayed camera frame {oldest_frame}: the sensor queue exceeded its safety buffer."
+            )
+        return ready
+
+    def _check_camera_delivery(self, world_frame):
+        """Keep ticking through normal GPU latency, but fail clearly if no image arrives."""
+        now = time.monotonic()
+        if self._camera_no_data_since is None:
+            self._camera_no_data_since = now
+        elapsed = now - self._camera_no_data_since
+        if elapsed >= 30.0:
+            raise RuntimeError(
+                "The RGB camera has not delivered any frames for 30 seconds, even though CARLA world ticks "
+                f"are advancing (latest world frame: {world_frame}). Check that the CARLA server is rendering "
+                "camera sensors, that sensor.camera.rgb is available, and that the server has not run out of GPU memory."
+            )
+        if elapsed >= 3.0 and now - self._last_camera_wait_log >= 3.0:
+            self.log.emit(
+                f"Waiting for RGB camera output · {elapsed:.1f}s without a frame · world frame {world_frame}. "
+                "The collector continues ticking so CARLA's delayed GPU frames can arrive."
+            )
+            self._last_camera_wait_log = now
 
     def _camera_callback(self, image):
         try:
@@ -313,15 +474,6 @@ class CarlaWorker(QThread):
                 self._images.put_nowait(packet)
         except Exception as exc:
             self.log.emit(f"Camera callback error: {exc}")
-
-    def _wait_image(self, frame, timeout):
-        deadline=time.monotonic()+timeout
-        while not self._stop.is_set() and time.monotonic()<deadline:
-            try:
-                packet=self._images.get(timeout=.05)
-                if packet["frame"] == int(frame): return packet
-            except queue.Empty: pass
-        return None
 
     def _emit_progress(self, town, spawn, sim_time):
         self.progress.emit({"town":town,"counts":dict(self._counts),"targets":dict(self._targets),"spawn":spawn,"sim_time":sim_time,"captures":self._capture_count,"failed":self._failed,"elapsed":time.monotonic()-self._started,"rate":self._capture_count/max(.001,time.monotonic()-self._started)})
@@ -347,6 +499,11 @@ class CarlaWorker(QThread):
         while True:
             try: self._images.get_nowait()
             except queue.Empty: break
+        self._pending_camera_packets.clear()
+        self._snapshot_history.clear()
+        self._last_processed_camera_frame = -1
+        self._camera_no_data_since = None
+        self._last_camera_wait_log = 0.0
 
     def _destroy_traffic(self):
         actors = self._owned_vehicles + self._owned_walkers
