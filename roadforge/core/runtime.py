@@ -18,7 +18,12 @@ from PIL import Image
 from .config import DEFAULT_CLASSES, snapshot_config
 from .metrics import confusion_matrix, metrics_from_confusion
 
-PALETTE = np.array([[0, 0, 0], [40, 210, 120], [255, 210, 40]], dtype=np.uint8)  # RGB
+PALETTE = np.array([
+    [0, 0, 0],       # background
+    [40, 210, 120],  # ego_drivable_area
+    [255, 210, 40],  # lane_lines
+    [255, 70, 70],   # vehicles
+], dtype=np.uint8)  # RGB
 
 
 def atomic_json(path: str | Path, data: dict) -> None:
@@ -134,7 +139,7 @@ def verify_checkpoint(path: str | Path, expected_classes: int = 3) -> dict:
 
 
 def transfer_report(path: str | Path, target_classes: int = 3) -> dict:
-    """Compare state tensor names/shapes with a three-class semantic model."""
+    """Compare checkpoint tensor names/shapes for the four-class semantic model."""
     import torch
     from ultralytics.nn.tasks import SemanticSegmentationModel
 
@@ -518,8 +523,30 @@ def evaluate_dataset(
     if max_examples < 0:
         raise ValueError("max_examples cannot be negative.")
 
+    data_yaml_path = dataset / "data.yaml"
+    if not data_yaml_path.is_file():
+        raise FileNotFoundError(f"Prepared dataset is missing data.yaml: {data_yaml_path}")
+    try:
+        import yaml
+        dataset_spec = yaml.safe_load(data_yaml_path.read_text(encoding="utf-8")) or {}
+    except Exception as exc:
+        raise ValueError(f"Could not read prepared data.yaml: {exc}") from exc
+    raw_names = dataset_spec.get("names", {})
+    if isinstance(raw_names, list):
+        names = {index: str(name) for index, name in enumerate(raw_names)}
+    elif isinstance(raw_names, dict):
+        names = {int(key): str(value) for key, value in raw_names.items()}
+    else:
+        raise ValueError("Prepared data.yaml must declare semantic class names.")
+    if names != DEFAULT_CLASSES:
+        raise ValueError(
+            "This RoadForge build expects the four-class semantic map "
+            f"{DEFAULT_CLASSES}; found {names}. Re-annotate legacy samples and prepare a new dataset."
+        )
+    num_classes = len(names)
+
     engine = SemanticEngine(model_path, imgsz, device)
-    total = np.zeros((3, 3), dtype=np.int64)
+    total = np.zeros((num_classes, num_classes), dtype=np.int64)
     by_group: dict[str, np.ndarray] = {}
     examples = []
     preview_count = min(max_examples, len(rows))
@@ -545,11 +572,11 @@ def evaluate_dataset(
             raise ValueError(f"Image/mask dimensions differ for {image.name}: {rgb.shape[:2]} vs {target.shape}")
 
         prediction = engine.predict(rgb)
-        matrix = confusion_matrix(target, prediction, 3, ignore_label)
+        matrix = confusion_matrix(target, prediction, num_classes, ignore_label)
         total += matrix
         for field in ("town", "weather", "traffic", "collection"):
             key = f"{field}:{row.get(field, 'Unknown')}"
-            by_group.setdefault(key, np.zeros((3, 3), dtype=np.int64))
+            by_group.setdefault(key, np.zeros((num_classes, num_classes), dtype=np.int64))
             by_group[key] += matrix
 
         if index - 1 in preview_indices:
@@ -568,7 +595,6 @@ def evaluate_dataset(
         if progress:
             progress(index, len(rows), image.name)
 
-    names = {0: "background", 1: "ego_drivable_area", 2: "lane_lines"}
     result = {
         "model": str(Path(model_path).expanduser().resolve()), "dataset": str(dataset), "split": split,
         "samples": len(rows), "ignore_label": ignore_label,
@@ -698,9 +724,9 @@ def compare_models(torch_model: str, onnx_model: str, image_path: str, imgsz: in
 
     torch_mask, torch_times = _timed_predictions(torch_engine, rgb, warmup=3, iterations=10)
     onnx_mask, onnx_times = _timed_predictions(onnx_engine, rgb, warmup=3, iterations=10)
-    # This Studio's semantic contract is fixed to three classes, including
-    # classes absent from an individual test image.
-    matrix = confusion_matrix(torch_mask, onnx_mask, num_classes=3)
+    # Include all four classes even when the selected parity image contains
+    # no vehicles. This catches accidental three-class exports.
+    matrix = confusion_matrix(torch_mask, onnx_mask, num_classes=len(DEFAULT_CLASSES))
     parity = metrics_from_confusion(matrix)
     return {
         "image": str(Path(image_path).resolve()), "agreement": float(np.mean(torch_mask == onnx_mask)),
