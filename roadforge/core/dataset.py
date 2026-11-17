@@ -160,6 +160,16 @@ def discover_collections(dataset_roots: Iterable[str | Path]) -> list[Collection
                         metadata["_annotation_original_image"] = entry.get("original_image")
                         metadata["_annotation_class_map"] = entry.get("class_map")
                         metadata["_annotation_num_classes"] = entry.get("num_classes")
+                        entry_class_map = entry.get("class_map")
+                        combined_path = str(entry.get("combined_mask", "")).replace("\\", "/")
+                        metadata["_annotation_legacy"] = bool(
+                            status == "success"
+                            and (
+                                not isinstance(entry_class_map, dict)
+                                or "3" not in entry_class_map
+                                or "combined_3class" in combined_path
+                            )
+                        )
                     elif status == "discovered_combined_4class":
                         metadata["_annotation_class_map"] = {
                             "0": "background", "1": "ego_drivable_area",
