@@ -107,6 +107,10 @@ def annotation_outputs_valid(collection, record):
             and bool(np.all(combined[vehicle > 0] == 3))
             and bool(np.all(combined[(drive > 0) & (lane == 0) & (vehicle == 0)] == 1))
             and record.get("class_map", {}).get("3") == "vehicles"
+            # Regenerate legacy vehicle annotations with the hood-exclusion
+            # pipeline instead of silently skipping masks made with old settings.
+            and int(record.get("vehicle_annotation", {}).get("pipeline_version", 0))
+                == DEFAULT_VEHICLE_ANNOTATION_PIPELINE_VERSION
         )
     except (KeyError, TypeError, ValueError, OSError, AttributeError):
         return False
@@ -193,6 +197,7 @@ def create_session(model_path, provider="Auto"):
 
 COCO_VEHICLE_CLASSES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
 DEFAULT_VEHICLE_CLASS_IDS = tuple(COCO_VEHICLE_CLASSES)
+DEFAULT_VEHICLE_ANNOTATION_PIPELINE_VERSION = 2
 DEFAULT_VEHICLE_SCORE_THRESHOLD = 0.50
 DEFAULT_VEHICLE_NMS_THRESHOLD = 0.40
 # Ignore the bottom 22% of the camera image for vehicle detections to exclude
@@ -762,6 +767,7 @@ class AnnotationWorker(QThread):
                         "class_map": {"0": "background", "1": "ego_drivable_area", "2": "lane_lines", "3": "vehicles"},
                         "num_classes": 4,
                         "vehicle_annotation": {
+                            "pipeline_version": DEFAULT_VEHICLE_ANNOTATION_PIPELINE_VERSION,
                             "enabled": self.annotate_vehicles,
                             "model": "YOLOPv2-ONNX",
                             "class_ids": list(self.vehicle_class_ids),
