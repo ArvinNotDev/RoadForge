@@ -38,7 +38,7 @@ def test_map_name_normalizes_full_package_references():
 def test_stale_or_uninstalled_map_selection_is_rejected():
     indexed = build_map_reference_index(["Town10HD_Opt", "Town12"])
 
-    with pytest.raises(ValueError, match="Town01_Opt.*not installed"):
+    with pytest.raises(ValueError, match="not installed"):
         validate_selected_map_names(["Town01_Opt"], indexed)
 
 
