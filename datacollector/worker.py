@@ -10,6 +10,7 @@ import numpy as np
 from PySide6.QtCore import QThread, Signal
 
 try:
+    from .weather import apply_weather_preset, format_weather_summary
     from .carla_compat import sticky_control_error_message, version_mismatch_message
     from .map_catalog import (
         build_map_reference_index, normalize_map_name, require_map_reference,
@@ -17,6 +18,7 @@ try:
     )
     from .storage import DatasetStore
 except ImportError:
+    from weather import apply_weather_preset, format_weather_summary
     from carla_compat import sticky_control_error_message, version_mismatch_message
     from map_catalog import (
         build_map_reference_index, normalize_map_name, require_map_reference,
@@ -301,13 +303,32 @@ class CarlaWorker(QThread):
         self.log.emit(f"Traffic Manager synchronous mode enabled on port {self.tm.get_port()}.")
 
     def _configure_weather(self):
-        preset = self.config.get("weather", "Default")
-        if preset == "Default": return
-        if not hasattr(__import__("carla"), preset):
-            self.log.emit(f"Unknown weather preset {preset}; retaining map default")
+        import carla
+
+        preset = str(self.config.get("weather", "Default") or "Default").strip()
+        if preset == "Default":
+            self.log.emit(
+                "Weather: Default · preserving the currently loaded map/world weather."
+            )
             return
-        weather = getattr(__import__("carla"), preset)
-        self.world.set_weather(weather)
+
+        self._say(f"Applying weather · {preset}")
+        try:
+            applied = apply_weather_preset(
+                self.world,
+                carla,
+                preset,
+                advance=self._tick_world,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to apply CARLA weather preset '{preset}': {exc}"
+            ) from exc
+
+        self.log.emit(
+            f"Weather applied and verified by CARLA World.get_weather(): "
+            f"{preset} · {format_weather_summary(applied)}"
+        )
 
     def _spawn_traffic(self):
         if not self.config.get("background_traffic"): return

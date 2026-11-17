@@ -60,3 +60,13 @@ the synchronous simulation continuously, and pairs each RGB frame with the snaps
 the same CARLA frame ID. It does not block waiting for the camera frame matching the
 most recent tick. Newly spawned Ego and camera actors are also confirmed in a world
 snapshot before the collection loop starts.
+
+
+## Weather presets
+
+Weather presets are resolved from `carla.WeatherParameters` (the CARLA Python API location),
+not from the root `carla` module. After applying a preset, the collector advances one
+synchronous frame and verifies the active values through `world.get_weather()`. An unknown
+preset or a server-side mismatch is reported as an error instead of silently keeping the
+map's previous weather. The `Default` option intentionally leaves the map/current-world
+weather unchanged.
