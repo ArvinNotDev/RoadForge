@@ -21,7 +21,7 @@ From the repository root:
 run_collector.bat
 ```
 
-The root `setup.bat` installs the shared desktop/runtime dependencies. The CARLA Python API is not bundled and must be made available to the selected Python environment separately.
+Run `setup.bat` once before launching the collector. It creates the project-local `.venv` and installs the dependencies from the root `requirements.txt`, including the CARLA 1.0 Python client. This keeps RoadForge's CARLA 1.0 API separate from any global CARLA 0.9.x installation. `run_collector.bat` automatically uses `.venv` when present.
 
 ## CARLA connection
 

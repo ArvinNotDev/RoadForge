@@ -44,16 +44,31 @@ The capture worker uses synchronous simulation stepping and records simulation t
 
 The collector does not bundle CARLA. **The Python client API and running Simulator must come from the exact same CARLA release/build.** A mismatched API can connect and list maps but fail later while reading actor blueprints, sometimes with `ValueError: sticky_control: invalid value type`.
 
-Compare versions using the same Python environment that launches RoadForge:
+RoadForge's Windows launcher uses the project-local `.venv` environment whenever it exists. Set it up from the repository root:
 
-```powershell
-python -c "import carla; c=carla.Client('127.0.0.1', 2000); print('module:', carla.__file__); print('client:', c.get_client_version()); print('server:', c.get_server_version())"
+```bat
+setup.bat
 ```
 
-Use the client library that matches the server:
-- For an official CARLA 1.0 server, install the CARLA 1.0 Python client in RoadForge's active environment (for example, `python -m pip install --upgrade carla==1.0`).
-- For a custom/source build, install the matching wheel shipped with that server under `PythonAPI/carla/dist`, selecting the wheel for the active Python version and Windows architecture.
-- For a CARLA 0.9.x server, use its corresponding 0.9.x client instead; do not mix the UE4 0.9.x client with the CARLA 1.0 UE5 client/server.
+The root `requirements.txt` pins `carla==1.0`, so this installs the CARLA 1.0 client into `.venv` while leaving any globally installed CARLA 0.9.16 client untouched.
+
+If you need to install or refresh the API manually in that environment:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install --upgrade "carla==1.0"
+```
+
+Alternatively, install the version-matched wheel shipped inside the CARLA 1.0 package from `CARLA_ROOT\PythonAPI\carla\dist\`. Choose the Windows `cp312-cp312-win_amd64.whl` wheel because RoadForge's setup creates a Python 3.12 environment. CARLA 1.0 release wheels are provided for Python 3.10 through 3.15.
+
+Verify the exact environment that will run the collector (keep the CARLA 1.0 server running):
+
+```powershell
+.\.venv\Scripts\python.exe -c "import sys, carla; c=carla.Client('127.0.0.1', 2000); print('python:', sys.executable); print('module:', carla.__file__); print('client:', c.get_client_version()); print('server:', c.get_server_version())"
+```
+
+The client and server versions must both report `1.0`. Then launch `run_collector.bat`, which automatically uses `.venv`.
+
+For a custom/source build, install the matching wheel shipped with that server rather than a wheel from another release. For a CARLA 0.9.x server, use its corresponding 0.9.x client instead; do not mix the UE4 0.9.x client with the CARLA 1.0 UE5 client/server.
 
 RoadForge logs both versions and the imported `carla` module path. It stops before collection if the reported versions differ and gives a targeted diagnostic for the `sticky_control` Blueprint error.
 
