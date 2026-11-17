@@ -9,7 +9,7 @@ flowchart TD
     A["CARLA simulator"] --> B["Data Collector<br/>PySide6 + CARLA Python API"]
     B --> C["Raw RGB collections<br/>images + JSONL metadata"]
     C --> D["YOLOPv2 ONNX teacher"]
-    D --> E["Three-class pseudo-labels<br/>drivable / lane / background"]
+    D --> E["Four-class pseudo-labels<br/>drivable / lane / vehicles / background"]
     C --> F["Dataset discovery"]
     E --> F
     F --> G["Validation & audit"]
@@ -31,11 +31,11 @@ The dashed edge represents a possible downstream integration path, not an assert
 
 A separate PySide6 application connects to a running CARLA server through the CARLA Python API. It configures towns, weather, the ego vehicle, optional background traffic, and an RGB camera. Captures are stored as lossless PNG files with per-frame JSONL metadata and a collection manifest.
 
-The collector's responsibilities are deliberately narrow: it records raw frames and metadata. It does not perform perception or write training labels during capture.
+The collector's responsibilities are deliberately narrow: it records raw frames and metadata. It enumerates installed maps from the connected CARLA server and does not perform perception or write training labels during capture.
 
 ### 2. Teacher annotation — `datacollector/teacher_labeling.py`
 
-The annotation interface runs an ONNX Runtime session for a compatible six-output YOLOPv2 graph. It derives drivable-area and lane-line masks, creates a combined three-class mask, and writes an annotation manifest. Existing annotations can be inspected and selectively reprocessed.
+The annotation interface runs one ONNX Runtime session for the compatible six-output YOLOPv2 graph. Outputs 4 and 5 provide the existing drivable-area and lane-line masks. Outputs 0–3 provide the COCO-80 vehicle detector; car, motorcycle, bus, and truck boxes are decoded, filtered with class-aware NMS, and converted to a vehicle mask with GrabCut (or a documented box fallback). The annotator creates a four-class combined mask and commits its manifest only after every output is written. Legacy three-class masks remain on disk and are reprocessed into a new output folder when selected.
 
 The annotator is an offline stage. This separation keeps collection deterministic and makes the teacher model, provider, and annotation outputs independently inspectable.
 
