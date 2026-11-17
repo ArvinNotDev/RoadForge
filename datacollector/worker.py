@@ -10,9 +10,11 @@ import numpy as np
 from PySide6.QtCore import QThread, Signal
 
 try:
+    from .carla_compat import sticky_control_error_message, version_mismatch_message
     from .map_catalog import build_map_reference_index, normalize_map_name, require_map_reference, validate_selected_map_names
     from .storage import DatasetStore
 except ImportError:
+    from carla_compat import sticky_control_error_message, version_mismatch_message
     from map_catalog import build_map_reference_index, normalize_map_name, require_map_reference, validate_selected_map_names
     from storage import DatasetStore
 
@@ -34,6 +36,9 @@ class CarlaWorker(QThread):
         self.client = self.world = self.vehicle = self.camera = None
         self.tm = None
         self._map_refs = {}
+        self._carla_client_version = None
+        self._carla_server_version = None
+        self._carla_module_path = None
         self._images = queue.Queue(maxsize=8)
         self._owned_vehicles = []
         self._owned_walkers = []
@@ -52,6 +57,24 @@ class CarlaWorker(QThread):
         self._say(f"Connecting to CARLA at {self.config['host']}:{self.config['port']}…")
         self.client = carla.Client(self.config["host"], int(self.config["port"]))
         self.client.set_timeout(float(self.config["timeout"]))
+        self._carla_module_path = getattr(carla, "__file__", None)
+        try:
+            self._carla_client_version = str(self.client.get_client_version())
+            self._carla_server_version = str(self.client.get_server_version())
+            self.log.emit(f"CARLA Python API version: {self._carla_client_version}")
+            self.log.emit(f"CARLA Simulator version: {self._carla_server_version}")
+            mismatch = version_mismatch_message(
+                self._carla_client_version,
+                self._carla_server_version,
+                self._carla_module_path,
+            )
+            if mismatch:
+                raise RuntimeError(mismatch)
+        except AttributeError:
+            self.log.emit(
+                "This CARLA API does not expose version-check methods; "
+                "compatibility will be checked when CARLA objects are accessed."
+            )
         self.world = self.client.get_world()
         current_map_reference = str(self.world.get_map().name).strip()
         current_town = normalize_map_name(current_map_reference)
@@ -249,7 +272,17 @@ class CarlaWorker(QThread):
     def _spawn_ego(self, points, used):
         import carla
         self._say("Spawning Ego vehicle…")
-        blueprint = self.world.get_blueprint_library().find(self.config["vehicle_blueprint"])
+        try:
+            blueprint_library = self.world.get_blueprint_library()
+            blueprint = blueprint_library.find(self.config["vehicle_blueprint"])
+        except ValueError as exc:
+            if "sticky_control" in str(exc):
+                raise RuntimeError(sticky_control_error_message(
+                    self._carla_client_version,
+                    self._carla_server_version,
+                    self._carla_module_path,
+                )) from exc
+            raise
         if blueprint.has_attribute("role_name"): blueprint.set_attribute("role_name", "hero")
         order = [i for i in range(len(points)) if i not in used] + [i for i in range(len(points)) if i in used]
         for i in order:

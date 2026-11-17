@@ -42,7 +42,20 @@ The capture worker uses synchronous simulation stepping and records simulation t
 
 ## CARLA Python API setup
 
-The collector does not bundle CARLA. Install or expose the Python API matching the CARLA server version. The API is commonly distributed with a CARLA release under its `PythonAPI` directory. Follow the official CARLA documentation for the matching release and set the required import path before starting the collector.
+The collector does not bundle CARLA. **The Python client API and running Simulator must come from the exact same CARLA release/build.** A mismatched API can connect and list maps but fail later while reading actor blueprints, sometimes with `ValueError: sticky_control: invalid value type`.
+
+Compare versions using the same Python environment that launches RoadForge:
+
+```powershell
+python -c "import carla; c=carla.Client('127.0.0.1', 2000); print('module:', carla.__file__); print('client:', c.get_client_version()); print('server:', c.get_server_version())"
+```
+
+Use the client library that matches the server:
+- For an official CARLA 1.0 server, install the CARLA 1.0 Python client in RoadForge's active environment (for example, `python -m pip install --upgrade carla==1.0`).
+- For a custom/source build, install the matching wheel shipped with that server under `PythonAPI/carla/dist`, selecting the wheel for the active Python version and Windows architecture.
+- For a CARLA 0.9.x server, use its corresponding 0.9.x client instead; do not mix the UE4 0.9.x client with the CARLA 1.0 UE5 client/server.
+
+RoadForge logs both versions and the imported `carla` module path. It stops before collection if the reported versions differ and gives a targeted diagnostic for the `sticky_control` Blueprint error.
 
 Run the collector from the repository root:
 
