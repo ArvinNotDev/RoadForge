@@ -76,6 +76,49 @@ def test_yolopv2_detection_decoder_extracts_only_supported_vehicle_classes():
         assert 0 <= y1 < y2 <= 96
 
 
+def test_vehicle_annotation_defaults_use_stricter_thresholds_and_bottom_crop():
+    teacher = _teacher_module()
+
+    assert teacher.DEFAULT_VEHICLE_SCORE_THRESHOLD == pytest.approx(0.50)
+    assert teacher.DEFAULT_VEHICLE_NMS_THRESHOLD == pytest.approx(0.40)
+    assert teacher.DEFAULT_VEHICLE_BOTTOM_KEEP_RATIO == pytest.approx(0.78)
+
+
+def test_decoder_discards_lower_region_and_clips_boxes_crossing_cutoff():
+    teacher = _teacher_module()
+    heads = []
+    for grid_size in (16, 8, 4):
+        heads.append(np.full((1, 255, grid_size, grid_size), -12.0, dtype=np.float32))
+
+    # A vehicle box crossing the 78% cutoff: retain its upper part.
+    heads[0][0, 0:4, 12, 5] = 0.0
+    heads[0][0, 4, 12, 5] = 12.0
+    heads[0][0, 5 + 2, 12, 5] = 12.0
+
+    # A hood-like detection entirely in the lower 22%: discard it.
+    heads[0][0, 0:4, 15, 10] = 0.0
+    heads[0][0, 4, 15, 10] = 12.0
+    heads[0][0, 5 + 7, 15, 10] = 12.0
+
+    anchors = np.asarray(
+        [12, 10, 30, 25, 40, 35], dtype=np.float32
+    ).reshape(1, 3, 1, 1, 2)
+    outputs = [heads, anchors, anchors, anchors, None, None]
+
+    detections = teacher.decode_vehicle_detections(
+        outputs,
+        input_size=(128, 128),
+        original_size=(128, 128),
+    )
+
+    assert len(detections) == 1
+    assert detections[0]["class_id"] == 2
+    x1, y1, x2, y2 = detections[0]["bbox"]
+    assert 0 <= x1 < x2 <= 128
+    assert 0 <= y1 < y2 <= 100
+    assert y1 < 100 and y2 == 100
+
+
 def test_vehicle_mask_is_exported_as_semantic_class_three():
     teacher = _teacher_module()
     rgb = np.zeros((40, 60, 3), dtype=np.uint8)
