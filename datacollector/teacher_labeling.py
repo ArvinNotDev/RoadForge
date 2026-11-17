@@ -534,6 +534,16 @@ def visualization(rgb, drive, lane, combined, vehicle=None, detections=None, opa
     colors[combined == 1] = (0, 200, 0)
     colors[combined == 2] = (255, 220, 0)
     colors[combined == 3] = (255, 70, 70)
+    detection_view = blended.copy()
+    for detection in detections or ():
+        x1, y1, x2, y2 = detection["bbox"]
+        score = float(detection["score"])
+        label = f"{detection['class_name']} {score:.2f}"
+        cv2.rectangle(detection_view, (x1, y1), (x2, y2), (255, 70, 70), 2)
+        cv2.putText(
+            detection_view, label, (x1, max(14, y1 - 5)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 70, 70), 1, cv2.LINE_AA,
+        )
     views = {
         "Original RGB": rgb,
         "Drivable Area": cv2.cvtColor(drive, cv2.COLOR_GRAY2RGB),
@@ -541,7 +551,7 @@ def visualization(rgb, drive, lane, combined, vehicle=None, detections=None, opa
         "Vehicle Mask": cv2.cvtColor(vehicle if vehicle is not None else np.zeros_like(drive), cv2.COLOR_GRAY2RGB),
         "Combined classes": colors,
         "Combined overlay": cv2.addWeighted(rgb, 0.58, colors, 0.42, 0),
-        "Vehicle detections": blended,
+        "Vehicle detections": detection_view,
     }
     return views
 
