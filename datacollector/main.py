@@ -36,9 +36,12 @@ class MainWindow(QMainWindow):
         self.annotation_scan_worker = None
         self.connected = False
         self.town_rows = {}
+        self._available_map_names = set()
+        self._collection_running = False
         self._build()
         self._style()
         self._update_totals()
+        self._update_collection_availability()
 
     def _build(self):
         # Let the window fit shorter displays and expose a vertical scrollbar
@@ -215,8 +218,8 @@ class MainWindow(QMainWindow):
         tabs.addTab(page_scroll, "YOLOPv2 Teacher Labeling")
         self._rescan_annotations()
 
-    def _populate_town_rows(self, towns):
-        """Rebuild town targets from the CARLA server's installed map list."""
+    def _populate_town_rows(self, towns, empty_message="Connect to CARLA to discover installed maps."):
+        """Show only map names supplied by the currently connected CARLA server."""
         previous = {
             name: {
                 "enabled": row["enabled"].isChecked(),
@@ -232,7 +235,17 @@ class MainWindow(QMainWindow):
                 widget.deleteLater()
         self.town_rows = {}
 
-        for town in sorted(set(str(name).split("/")[-1] for name in towns)):
+        names = sorted({
+            str(name).strip().rstrip("/").split("/")[-1]
+            for name in towns
+            if str(name).strip().rstrip("/")
+        })
+        if not names:
+            placeholder = QLabel(empty_message)
+            placeholder.setObjectName("muted")
+            placeholder.setWordWrap(True)
+            self.town_rows_layout.addWidget(placeholder)
+        for town in names:
             old = previous.get(town, {})
             row_widget = QWidget()
             row = QGridLayout(row_widget)
@@ -258,19 +271,29 @@ class MainWindow(QMainWindow):
         self._update_totals()
 
     def _available_maps(self, maps):
-        """Apply the exact map list returned by the connected CARLA server."""
-        if not maps:
-            return
+        """Replace the selector with the map list reported by the CARLA server."""
         current = self.current_town.text()
-        names = sorted(set(str(name).split("/")[-1] for name in maps))
-        self._populate_town_rows(names)
-        self.logs.appendPlainText(
-            f"Discovered {len(names)} installed CARLA map(s): " + ", ".join(names)
+        names = sorted({
+            str(name).strip().rstrip("/").split("/")[-1]
+            for name in maps
+            if str(name).strip().rstrip("/")
+        })
+        self._available_map_names = set(names)
+        empty_message = (
+            "CARLA did not report any installed maps. Check the server and CARLA Python API."
         )
-        if current and current != "—" and current not in names:
+        self._populate_town_rows(names, empty_message=empty_message)
+        if names:
+            self.logs.appendPlainText(
+                f"Discovered {len(names)} installed CARLA map(s): " + ", ".join(names)
+            )
+        else:
+            self.logs.appendPlainText("CARLA did not report any installed maps; collection is disabled.")
+        if current and current != "—" and names and current not in names:
             self.logs.appendPlainText(
                 f"Current world '{current}' is not in the discovered map list."
             )
+        self._update_collection_availability()
 
     def _choose_model(self):
         path, _ = QFileDialog.getOpenFileName(self, "Choose YOLOPv2 ONNX model", str(Path(self.model_path.text()).parent), "ONNX models (*.onnx)")
@@ -555,6 +578,11 @@ class MainWindow(QMainWindow):
         total=sum(row["target"].value() for row in self.town_rows.values() if row["enabled"].isChecked())
         self.total_label.setText(f"Selected target: {total:,}")
 
+    def _update_collection_availability(self):
+        if hasattr(self, "start_btn"):
+            ready = self.connected and bool(self._available_map_names) and not self._collection_running
+            self.start_btn.setEnabled(ready)
+
     def _set_towns(self,value):
         for row in self.town_rows.values(): row["enabled"].setChecked(value)
     def _browse(self):
@@ -574,17 +602,51 @@ class MainWindow(QMainWindow):
             if self.worker and self.worker.isRunning():
                 self.worker.stop()
             self.connected = False
+            self._available_map_names.clear()
+            self._populate_town_rows([])
             self.connect_btn.setText("Connect")
             self._status("Disconnected")
+            self._update_collection_availability()
             return
         self._start_worker(True)
         self.connect_btn.setEnabled(False)
+
     def start_collection(self):
-        config=self._config()
-        if not any(v["enabled"] and v["target"]>0 for v in config["towns"].values()):
-            QMessageBox.warning(self,"No towns selected","Select at least one town with a positive target."); return
-        QMessageBox.information(self,"World loading","Collection loads each selected town. CARLA's currently loaded world will be replaced as town changes.")
-        self.start_btn.setEnabled(False); self.pause_btn.setEnabled(True); self.stop_btn.setEnabled(True); self.status.setText("Starting")
+        if not self.connected or not self._available_map_names:
+            QMessageBox.warning(
+                self, "Connect to CARLA first",
+                "Connect to a running CARLA server to discover its installed maps before starting collection."
+            )
+            return
+        if self.worker and self.worker.isRunning():
+            QMessageBox.information(self, "CARLA connection", "Wait for the current CARLA operation to finish.")
+            return
+        config = self._config()
+        selected = [
+            name for name, spec in config["towns"].items()
+            if spec["enabled"] and int(spec["target"]) > 0
+        ]
+        if not selected:
+            QMessageBox.warning(self, "No maps selected", "Select at least one installed map with a positive target.")
+            return
+        unavailable = sorted(set(selected) - self._available_map_names)
+        if unavailable:
+            QMessageBox.warning(
+                self, "Map list changed",
+                "These maps are no longer in the connected server's installed map list: "
+                + ", ".join(unavailable) + ". Reconnect to refresh the map selector."
+            )
+            return
+        QMessageBox.information(
+            self, "World loading",
+            "Collection loads each selected map. CARLA's currently loaded world will be replaced as the map changes."
+        )
+        self._collection_running = True
+        self._update_collection_availability()
+        self.pause_btn.setEnabled(True)
+        self.stop_btn.setEnabled(True)
+        self.connect_btn.setEnabled(False)
+        self.status.setText("Starting")
         self._start_worker(False)
     def pause(self):
         if self.worker:self.worker.pause(); self.pause_btn.setEnabled(False); self.resume_btn.setEnabled(True)
@@ -618,7 +680,12 @@ class MainWindow(QMainWindow):
         if result == "Connected":
             self.connected = True
             self.connect_btn.setText("Disconnect")
-        self.start_btn.setEnabled(True); self.pause_btn.setEnabled(False); self.resume_btn.setEnabled(False); self.stop_btn.setEnabled(False); self.connect_btn.setEnabled(True)
+        self._collection_running = False
+        self.pause_btn.setEnabled(False)
+        self.resume_btn.setEnabled(False)
+        self.stop_btn.setEnabled(False)
+        self.connect_btn.setEnabled(True)
+        self._update_collection_availability()
 
     def closeEvent(self,event):
         if self.annotation_scan_worker and self.annotation_scan_worker.isRunning():

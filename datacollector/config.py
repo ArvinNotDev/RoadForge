@@ -2,9 +2,9 @@
 from dataclasses import dataclass, asdict
 
 
-# Fallback list for CARLA 1.0. The collector replaces this list with the exact
-# maps reported by the connected server via Client.get_available_maps().
-TOWNS = ("Town01_Opt", "Town02_Opt", "Town03_Opt", "Town04_Opt", "Town05_Opt", "Town10HD_Opt")
+# CARLA maps are discovered from the connected server at runtime.
+# Keep the initial list empty so unsupported legacy names can never be selected.
+TOWNS = ()
 CAMERA_REFERENCE = {
     "width": 640, "height": 384, "fov": 120.0,
     "x": 1.4, "y": 0.0, "z": 2.2,

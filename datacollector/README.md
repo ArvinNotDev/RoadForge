@@ -29,7 +29,7 @@ The default connection is `127.0.0.1:2000`. The CARLA server must be running, an
 
 ## Default capture profile
 
-- All maps reported by the running CARLA server are available for selection; the initial fallback list uses CARLA 1.0 optimized maps.
+- Map choices are empty until the user connects; only maps reported by the running CARLA server are shown. If the client API does not support map enumeration, only the currently loaded map is offered.
 - 700 target frames per enabled map
 - 640 × 384 RGB camera, 120° FOV
 - Camera transform `(1.4, 0.0, 2.2)` and pitch `-25°`

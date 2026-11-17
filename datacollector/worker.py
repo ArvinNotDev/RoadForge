@@ -10,8 +10,10 @@ import numpy as np
 from PySide6.QtCore import QThread, Signal
 
 try:
+    from .map_catalog import build_map_reference_index, normalize_map_name, require_map_reference, validate_selected_map_names
     from .storage import DatasetStore
 except ImportError:
+    from map_catalog import build_map_reference_index, normalize_map_name, require_map_reference, validate_selected_map_names
     from storage import DatasetStore
 
 
@@ -51,26 +53,38 @@ class CarlaWorker(QThread):
         self.client = carla.Client(self.config["host"], int(self.config["port"]))
         self.client.set_timeout(float(self.config["timeout"]))
         self.world = self.client.get_world()
-        current_town = self.world.get_map().name.split("/")[-1]
+        current_map_reference = str(self.world.get_map().name).strip()
+        current_town = normalize_map_name(current_map_reference)
         self._say(f"Connected · current town: {current_town}")
         get_maps = getattr(self.client, "get_available_maps", None)
         if callable(get_maps):
             try:
                 available = list(get_maps())
-                for map_reference in available:
-                    name = str(map_reference).rstrip("/").split("/")[-1]
-                    if name:
-                        self._map_refs[name] = str(map_reference)
-                if self._map_refs:
-                    self.maps_available.emit(sorted(self._map_refs))
-                    self.log.emit(
-                        f"CARLA server reports {len(self._map_refs)} installed maps."
-                    )
+                self._map_refs = build_map_reference_index(available)
             except Exception as exc:
-                self.log.emit(f"Could not enumerate installed CARLA maps: {exc}")
-        if not self._map_refs:
-            self._map_refs[current_town] = current_town
-            self.maps_available.emit([current_town])
+                self.maps_available.emit([])
+                raise RuntimeError(
+                    f"Could not enumerate installed CARLA maps: {exc}"
+                ) from exc
+            if not self._map_refs:
+                self.maps_available.emit([])
+                raise RuntimeError(
+                    "CARLA returned no installed maps. Check the server's map packages and CARLA Python API."
+                )
+        else:
+            # Older CARLA Python APIs may not expose get_available_maps().
+            # In that case, the already loaded world is the only verified map.
+            self._map_refs = build_map_reference_index([current_map_reference])
+            if not self._map_refs:
+                raise RuntimeError("CARLA could not provide a valid reference for its current map.")
+            self.log.emit(
+                "This CARLA API does not expose get_available_maps(); only the currently loaded map is available."
+            )
+        self.maps_available.emit(sorted(self._map_refs))
+        self.log.emit(
+            f"CARLA server reports {len(self._map_refs)} available map(s): "
+            + ", ".join(sorted(self._map_refs))
+        )
 
     def run(self):
         result = "Stopped"
@@ -93,7 +107,8 @@ class CarlaWorker(QThread):
         from datetime import datetime
         selected = [name for name, spec in self.config["towns"].items() if spec["enabled"] and int(spec["target"]) > 0]
         if not selected:
-            raise ValueError("Select at least one town with a positive target")
+            raise ValueError("Select at least one installed CARLA map with a positive target")
+        selected = validate_selected_map_names(selected, self._map_refs)
         store = DatasetStore(self.config["output_directory"], self.config)
         counts = {town: store.existing_count(town) for town in selected}
         targets = {town: int(self.config["towns"][town]["target"]) for town in selected}
@@ -180,9 +195,9 @@ class CarlaWorker(QThread):
         self._say("All selected town targets reached" if not self._stop.is_set() else "Collection stopped")
 
     def _load_town(self, town):
+        map_reference = require_map_reference(town, self._map_refs)
         self._say(f"Loading {town} · CARLA will replace its current world")
         self._destroy_ego(); self._destroy_traffic(); self._restore_world()
-        map_reference = self._map_refs.get(town, town)
         self.log.emit(f"CARLA map reference: {map_reference}")
         self.world = self.client.load_world(map_reference)
         self._old_world = self.world
