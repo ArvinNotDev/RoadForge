@@ -363,7 +363,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(head)
         class_row = QHBoxLayout()
         self.class_names = []
-        for index, default in enumerate(("background", "ego_drivable_area", "lane_lines")):
+        for index, default in enumerate(("background", "ego_drivable_area", "lane_lines", "vehicles")):
             edit = QLineEdit(default); edit.setReadOnly(True); edit.setMaximumWidth(230); edit.setToolTip(f"Fixed semantic class ID {index}; meanings match the source combined masks")
             self.class_names.append(edit)
             class_row.addWidget(QLabel(f"{index}:")); class_row.addWidget(edit)
@@ -372,7 +372,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(class_row)
         dataset_row = QHBoxLayout()
         self.data_yaml_edit = QLineEdit()
-        self.data_yaml_edit.setPlaceholderText("Prepared data.yaml (created from validated combined_3class masks)")
+        self.data_yaml_edit.setPlaceholderText("Prepared four-class data.yaml (created from validated combined_4class masks)")
         dataset_row.addWidget(self.data_yaml_edit, 1)
         dataset_row.addWidget(button("Browse data.yaml…", lambda: self._choose_data_yaml()))
         self.use_prepared_button = button("Use latest prepared dataset", self.use_prepared_dataset)
@@ -519,7 +519,7 @@ class MainWindow(QMainWindow):
         self.test_status = QLabel("Choose a semantic model and input source."); self.test_status.setObjectName("Muted"); layout.addWidget(self.test_status)
         preview_grid = QGridLayout()
         self.test_previews = {}
-        for index, title in enumerate(("Original RGB", "Semantic class map", "Prediction overlay", "Drivable area only", "Lane lines only")):
+        for index, title in enumerate(("Original RGB", "Semantic class map", "Prediction overlay", "Drivable area only", "Lane lines only", "Vehicles only")):
             tile = QWidget(); tile_layout = QVBoxLayout(tile); tile_layout.setContentsMargins(2, 2, 2, 2)
             caption = QLabel(title); caption.setObjectName("Muted"); tile_layout.addWidget(caption)
             preview = QLabel(title); preview.setAlignment(Qt.AlignmentFlag.AlignCenter); preview.setMinimumSize(260, 190)
@@ -805,7 +805,15 @@ class MainWindow(QMainWindow):
             counts[issue.severity] = counts.get(issue.severity, 0) + 1
         self.quality_status.setText(f"Checked {report.checked:,} · valid pairs {len(report.valid):,} · invalid samples {report.invalid_count:,} · errors {counts.get('error',0):,} · warnings {counts.get('warning',0):,}")
         total = max(1, sum(report.class_pixels.values()))
-        dist = " · ".join(f"{k} {name}: {report.class_pixels.get(k,0):,} px ({100*report.class_pixels.get(k,0)/total:.2f}%) / {report.class_images.get(k,0):,} images" for k, name in ((0,"background"),(1,"drivable"),(2,"lane")))
+        dist = " · ".join(
+            f"{k} {name}: {report.class_pixels.get(k,0):,} px "
+            f"({100*report.class_pixels.get(k,0)/total:.2f}%) / "
+            f"{report.class_images.get(k,0):,} images"
+            for k, name in (
+                (0, "background"), (1, "drivable"),
+                (2, "lane"), (3, "vehicles"),
+            )
+        )
         self.quality_stats.setText(f"Valid image-mask pairs: {len(report.valid):,} / {report.checked:,}. Dimensions: {report.dimensions}. Pixel distribution: {dist}")
         self.issue_table.setRowCount(0)
         display_issues = report.issues[:3000]
@@ -1347,6 +1355,7 @@ class MainWindow(QMainWindow):
         display_image(result["overlay"], self.test_preview, QSize(420, 240))
         display_image(result["drivable"], self.test_previews["Drivable area only"], QSize(420, 240))
         display_image(result["lane_lines"], self.test_previews["Lane lines only"], QSize(420, 240))
+        display_image(result["vehicles"], self.test_previews["Vehicles only"], QSize(420, 240))
 
     def choose_test_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select image directory", str(PROJECT_ROOT))

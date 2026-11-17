@@ -21,6 +21,7 @@ def test_main_window_loads_all_sections_and_controls(tmp_path, monkeypatch):
     assert window.PAGES[0] == "Dashboard"
     assert window.model_name.text() == "YOLO26l-sem · semantic"
     assert all(edit.isReadOnly() for edit in window.class_names)
+    assert [edit.text() for edit in window.class_names] == ["background", "ego_drivable_area", "lane_lines", "vehicles"]
     assert hasattr(window, "traffic_filter")
     assert window.model_registry_table.columnCount() == 7
     window.model_size.setCurrentText("n")

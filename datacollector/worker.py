@@ -21,6 +21,7 @@ class CarlaWorker(QThread):
     progress = Signal(dict)
     preview = Signal(object)
     finished_result = Signal(str)
+    maps_available = Signal(list)
 
     def __init__(self, config, connect_only=False):
         super().__init__()
@@ -30,6 +31,7 @@ class CarlaWorker(QThread):
         self._stop = threading.Event()
         self.client = self.world = self.vehicle = self.camera = None
         self.tm = None
+        self._map_refs = {}
         self._images = queue.Queue(maxsize=8)
         self._owned_vehicles = []
         self._owned_walkers = []
@@ -49,7 +51,26 @@ class CarlaWorker(QThread):
         self.client = carla.Client(self.config["host"], int(self.config["port"]))
         self.client.set_timeout(float(self.config["timeout"]))
         self.world = self.client.get_world()
-        self._say(f"Connected · current town: {self.world.get_map().name.split('/')[-1]}")
+        current_town = self.world.get_map().name.split("/")[-1]
+        self._say(f"Connected · current town: {current_town}")
+        get_maps = getattr(self.client, "get_available_maps", None)
+        if callable(get_maps):
+            try:
+                available = list(get_maps())
+                for map_reference in available:
+                    name = str(map_reference).rstrip("/").split("/")[-1]
+                    if name:
+                        self._map_refs[name] = str(map_reference)
+                if self._map_refs:
+                    self.maps_available.emit(sorted(self._map_refs))
+                    self.log.emit(
+                        f"CARLA server reports {len(self._map_refs)} installed maps."
+                    )
+            except Exception as exc:
+                self.log.emit(f"Could not enumerate installed CARLA maps: {exc}")
+        if not self._map_refs:
+            self._map_refs[current_town] = current_town
+            self.maps_available.emit([current_town])
 
     def run(self):
         result = "Stopped"
@@ -139,6 +160,7 @@ class CarlaWorker(QThread):
                             "spawn_point_id": index, "camera_resolution": [camera["width"],camera["height"]],
                             "camera_fov": camera["fov"], "camera_transform": {k:camera[k] for k in ("x","y","z","pitch","yaw","roll")},
                             "weather": self.config["weather"], "vehicle_blueprint": self.config["vehicle_blueprint"],
+                            "carla_map_reference": self._map_refs.get(town, town),
                             "traffic_manager": {"port": self.tm.get_port(), "speed_difference_percent": self.config["tm_speed_difference"]},
                             "town_target": targets[town], "town_count": counts[town]+1,
                         }
@@ -160,7 +182,9 @@ class CarlaWorker(QThread):
     def _load_town(self, town):
         self._say(f"Loading {town} · CARLA will replace its current world")
         self._destroy_ego(); self._destroy_traffic(); self._restore_world()
-        self.world = self.client.load_world(town)
+        map_reference = self._map_refs.get(town, town)
+        self.log.emit(f"CARLA map reference: {map_reference}")
+        self.world = self.client.load_world(map_reference)
         self._old_world = self.world
 
     def _configure_world(self):

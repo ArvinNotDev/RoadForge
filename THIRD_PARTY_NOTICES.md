@@ -2,16 +2,16 @@
 
 RoadForge is an independent project. It relies on third-party libraries and model artifacts whose terms remain separate from the MIT license covering original RoadForge source code.
 
-## YOLOPv2 ONNX preprocessing reference
+## YOLOPv2 ONNX preprocessing and detection reference
 
-The offline YOLOPv2 adapter in `datacollector/teacher_labeling.py` contains an adaptation of preprocessing and segmentation-mask extraction patterns from:
+The offline YOLOPv2 adapter in `datacollector/teacher_labeling.py` adapts preprocessing, segmentation-mask extraction, detection-head decoding, and anchor-grid post-processing from:
 
 - Project: [Kazuhito00/YOLOPv2-ONNX-Sample](https://github.com/Kazuhito00/YOLOPv2-ONNX-Sample)
 - Author: KazuhitoTakahashi
 - License: MIT
 - License file: [upstream LICENSE](https://github.com/Kazuhito00/YOLOPv2-ONNX-Sample/blob/main/LICENSE)
 
-The upstream MIT attribution and permission notice are reproduced below.
+The upstream MIT attribution and permission notice are reproduced below. RoadForge keeps the original six-output contract (detection heads and anchor grids at outputs 0–3; drivable and lane outputs at 4–5) and documents the adapted post-processing in `docs/DATASET_FORMAT.md`.
 
 ```text
 MIT License

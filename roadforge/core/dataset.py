@@ -10,8 +10,10 @@ from typing import Iterable
 import numpy as np
 from PIL import Image, UnidentifiedImageError
 
+from .config import DEFAULT_CLASSES
+
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
-VALID_CLASS_IDS = {0, 1, 2}
+VALID_CLASS_IDS = set(DEFAULT_CLASSES)
 
 
 @dataclass
@@ -134,22 +136,48 @@ def discover_collections(dataset_roots: Iterable[str | Path]) -> list[Collection
                     entry = annotation_entries.get(rel, {})
                     mask = None
                     status = str(entry.get("status", "missing"))
-                    # Primary labels come only from combined_mask in the teacher manifest.
+                    # Only a committed four-class teacher target is eligible for the
+                    # current YOLO26-sem training contract.
                     combined = entry.get("combined_mask") if status == "success" else None
                     mask_path = _safe_manifest_path(collection, str(combined)) if combined else None
                     if mask_path and mask_path.is_file():
                         mask = str(mask_path)
                     elif not entry:
-                        # A manifest-free import can still discover a uniquely named canonical
-                        # combined mask. Binary directories and visualizations are never candidates.
-                        candidate = collection / "labels_yolopv2" / town_dir.name / "combined_3class" / image.name
-                        if candidate.is_file():
-                            mask = str(candidate)
+                        # Support manifest-free imports while preferring the newest
+                        # four-class labels. Old three-class labels remain discoverable
+                        # for audit/upgrade but validation will block their use for training.
+                        candidate_v4 = collection / "labels_yolopv2" / town_dir.name / "combined_4class" / image.name
+                        candidate_v3 = collection / "labels_yolopv2" / town_dir.name / "combined_3class" / image.name
+                        if candidate_v4.is_file():
+                            mask = str(candidate_v4)
+                            status = "discovered_combined_4class"
+                        elif candidate_v3.is_file():
+                            mask = str(candidate_v3)
                             status = "discovered_combined_3class"
                     metadata = metadata_by_path.get(rel, metadata_by_filename.get(image.name, {}))
                     metadata = dict(metadata)
                     if entry:
                         metadata["_annotation_original_image"] = entry.get("original_image")
+                        metadata["_annotation_class_map"] = entry.get("class_map")
+                        metadata["_annotation_num_classes"] = entry.get("num_classes")
+                        entry_class_map = entry.get("class_map")
+                        combined_path = str(entry.get("combined_mask", "")).replace("\\", "/")
+                        metadata["_annotation_legacy"] = bool(
+                            status == "success"
+                            and (
+                                not isinstance(entry_class_map, dict)
+                                or "3" not in entry_class_map
+                                or "combined_3class" in combined_path
+                            )
+                        )
+                    elif status == "discovered_combined_4class":
+                        metadata["_annotation_class_map"] = {
+                            "0": "background", "1": "ego_drivable_area",
+                            "2": "lane_lines", "3": "vehicles",
+                        }
+                        metadata["_annotation_num_classes"] = 4
+                    elif status == "discovered_combined_3class":
+                        metadata["_annotation_legacy"] = True
                     town = str(metadata.get("town", town_dir.name))
                     traffic_obj = metadata.get("traffic_manager", {})
                     traffic_value = traffic_obj.get("vehicle_count", traffic_obj.get("traffic_level", "Unknown")) if isinstance(traffic_obj, dict) else "Unknown"
@@ -174,7 +202,15 @@ def discover_collections(dataset_roots: Iterable[str | Path]) -> list[Collection
                     continue
                 town = Path(str(rel)).parts[1] if len(Path(str(rel)).parts) > 1 else "Unknown"
                 mask = _safe_manifest_path(collection, str(entry.get("combined_mask", ""))) if entry.get("status") == "success" else None
-                metadata = {"_annotation_original_image": entry.get("original_image")}
+                metadata = {
+                    "_annotation_original_image": entry.get("original_image"),
+                    "_annotation_class_map": entry.get("class_map"),
+                    "_annotation_num_classes": entry.get("num_classes"),
+                    "_annotation_legacy": (
+                        not isinstance(entry.get("class_map"), dict)
+                        or "3" not in entry.get("class_map", {})
+                    ),
+                }
                 samples.append(Sample(str(image), str(mask) if mask else None, str(collection), town, session_id, session_id,
                                       image.name, "Unknown", "Unknown", "Unknown", str(entry.get("status", "missing")), metadata))
             weather = sorted({s.weather for s in samples})
@@ -228,6 +264,24 @@ def validate_samples(samples: Iterable[Sample], ignore_label: int | None = None)
                 issues.append(ValidationIssue("error", "mismatched_pair", f"Annotation manifest pairs this mask with {declared_image}, not {actual_rel}.", sample.image, sample.mask or "", sample.collection))
                 invalid_images.add(sample.image)
                 continue
+        if sample.metadata.get("_annotation_legacy"):
+            issues.append(ValidationIssue(
+                "error", "legacy_class_map",
+                "This image is still annotated with the legacy three-class YOLOPv2 mask. "
+                "Run YOLOPv2 Teacher Labeling with vehicle annotation enabled to create combined_4class.",
+                sample.image, sample.mask or "", sample.collection,
+            ))
+            invalid_images.add(sample.image)
+            continue
+        class_map = sample.metadata.get("_annotation_class_map")
+        if isinstance(class_map, dict) and "3" not in class_map:
+            issues.append(ValidationIssue(
+                "error", "legacy_class_map",
+                "Annotation manifest does not declare class 3 (vehicles). Re-annotate this image before preparing a four-class dataset.",
+                sample.image, sample.mask or "", sample.collection,
+            ))
+            invalid_images.add(sample.image)
+            continue
         if not image_path.is_file():
             issues.append(ValidationIssue("error", "missing_image", "Image file does not exist.", sample.image, sample.mask or "", sample.collection))
             invalid_images.add(sample.image)
@@ -277,7 +331,13 @@ def validate_samples(samples: Iterable[Sample], ignore_label: int | None = None)
         allowed = VALID_CLASS_IDS | ({ignore_label} if ignore_label is not None else set())
         unexpected = found - allowed
         if unexpected:
-            issues.append(ValidationIssue("error", "unexpected_class_ids", f"Mask contains values {sorted(unexpected)}; expected classes 0, 1, 2" + (f" and ignore {ignore_label}" if ignore_label is not None else "."), sample.image, sample.mask, sample.collection))
+            expected_ids = ", ".join(str(value) for value in sorted(VALID_CLASS_IDS))
+            issues.append(ValidationIssue(
+                "error", "unexpected_class_ids",
+                f"Mask contains values {sorted(unexpected)}; expected class IDs {expected_ids}"
+                + (f" and ignore {ignore_label}" if ignore_label is not None else "."),
+                sample.image, sample.mask, sample.collection,
+            ))
             invalid_images.add(sample.image)
             continue
         counts = np.bincount(mask.reshape(-1), minlength=max(VALID_CLASS_IDS) + 1)

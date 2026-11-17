@@ -69,18 +69,20 @@ class MainWindow(QMainWindow):
         form.addRow("Host",hostrow); form.addRow("Timeout (s)",self.timeout); form.addRow("Current town",self.current_town); form.addRow(self.connect_btn)
         left.addWidget(conn)
 
-        towns=QGroupBox("Town targets"); tv=QVBoxLayout(towns)
+        towns=QGroupBox("Installed CARLA maps · targets")
+        tv=QVBoxLayout(towns)
         actions=QHBoxLayout(); self.select_all=QPushButton("Select all"); self.select_none=QPushButton("Select none")
         self.select_all.clicked.connect(lambda:self._set_towns(True)); self.select_none.clicked.connect(lambda:self._set_towns(False))
         actions.addWidget(self.select_all); actions.addWidget(self.select_none); actions.addStretch()
         self.total_label=QLabel("0 / 0 images")
         actions.addWidget(self.total_label); tv.addLayout(actions)
-        for town in TOWNS:
-            row=QGridLayout(); enabled=QCheckBox(town); enabled.setChecked(True)
-            target=self._spin(0,1000000,700); count=QLabel("0 / 700 · Pending"); bar=QProgressBar(); bar.setRange(0,100); bar.setValue(0)
-            enabled.stateChanged.connect(self._update_totals); target.valueChanged.connect(self._update_totals)
-            row.addWidget(enabled,0,0); row.addWidget(QLabel("Target"),0,1); row.addWidget(target,0,2); row.addWidget(count,0,3); row.addWidget(bar,1,0,1,4)
-            tv.layout().addLayout(row); self.town_rows[town]={"enabled":enabled,"target":target,"count":count,"bar":bar,"status":"Pending"}
+        self.town_rows = {}
+        self.town_rows_container = QWidget()
+        self.town_rows_layout = QVBoxLayout(self.town_rows_container)
+        self.town_rows_layout.setContentsMargins(0, 0, 0, 0)
+        town_scroll = QScrollArea(); town_scroll.setWidgetResizable(True); town_scroll.setWidget(self.town_rows_container)
+        tv.addWidget(town_scroll, 1)
+        self._populate_town_rows(TOWNS)
         left.addWidget(towns,1)
 
         right=QVBoxLayout(); top.addLayout(right,2)
@@ -145,6 +147,26 @@ class MainWindow(QMainWindow):
         mf.addWidget(self.model_info, 1, 0, 1, 2); mf.addWidget(QLabel("Execution provider"), 1, 2); mf.addWidget(self.provider_combo, 1, 3)
         mf.addWidget(self.provider_info, 2, 0, 1, 3); mf.addWidget(self.save_vis, 2, 3); layout.addWidget(model_box)
 
+        vehicle_box = QGroupBox("YOLOPv2 vehicle pseudo-labels · class 3")
+        vf = QGridLayout(vehicle_box)
+        self.annotate_vehicles = QCheckBox("Detect vehicles and add the semantic vehicles class")
+        self.annotate_vehicles.setChecked(True)
+        self.vehicle_confidence = self._dspin(0.01, 0.99, 0.30, 0.01)
+        self.vehicle_nms = self._dspin(0.01, 0.99, 0.45, 0.01)
+        self.vehicle_mask_method = QComboBox()
+        self.vehicle_mask_method.addItem("GrabCut silhouette (recommended)", "grabcut")
+        self.vehicle_mask_method.addItem("Bounding boxes (coarse)", "box")
+        vf.addWidget(self.annotate_vehicles, 0, 0, 1, 4)
+        vf.addWidget(QLabel("Detection confidence"), 1, 0); vf.addWidget(self.vehicle_confidence, 1, 1)
+        vf.addWidget(QLabel("NMS IoU"), 1, 2); vf.addWidget(self.vehicle_nms, 1, 3)
+        vf.addWidget(QLabel("Vehicle mask extraction"), 2, 0); vf.addWidget(self.vehicle_mask_method, 2, 1, 1, 3)
+        vehicle_hint = QLabel("COCO car / motorcycle / bus / truck detections are merged into one class. "
+                              "GrabCut attempts a foreground silhouette inside each YOLOPv2 box; "
+                              "failed instances fall back to a coarse box and are counted in the manifest.")
+        vehicle_hint.setWordWrap(True); vehicle_hint.setObjectName("muted")
+        vf.addWidget(vehicle_hint, 3, 0, 1, 4)
+        layout.addWidget(vehicle_box)
+
         split = QSplitter(Qt.Horizontal)
         selection = QGroupBox("Collections and towns · all selected by default"); sv = QVBoxLayout(selection)
         actions = QHBoxLayout()
@@ -157,12 +179,16 @@ class MainWindow(QMainWindow):
 
         preview_box = QGroupBox("Preview · same inference pipeline as batch"); pv = QVBoxLayout(preview_box)
         pr = QHBoxLayout(); self.preview_btn = QPushButton("Preview Selected Image…"); self.preview_btn.clicked.connect(self._preview_file)
-        self.preview_view = QComboBox(); self.preview_view.addItems(["Original RGB", "Drivable Area", "Lane Lines", "Combined classes", "Combined overlay"])
+        self.preview_view = QComboBox(); self.preview_view.addItems([
+            "Original RGB", "Drivable Area", "Lane Lines", "Vehicle Mask",
+            "Combined classes", "Combined overlay", "Vehicle detections"
+        ])
         self.preview_view.currentTextChanged.connect(self._refresh_annotation_preview)
         pr.addWidget(self.preview_btn); pr.addWidget(self.preview_view); pv.addLayout(pr)
         self.annotation_preview = QLabel("Select an image to preview"); self.annotation_preview.setAlignment(Qt.AlignCenter); self.annotation_preview.setMinimumSize(400, 300); self.annotation_preview.setObjectName("preview"); pv.addWidget(self.annotation_preview, 1)
         self.preview_dims = QLabel("Source and mask dimensions: —"); pv.addWidget(self.preview_dims)
-        self.preview_legend = QLabel("Legend: Background · Green: Drivable Area · Yellow: Lane Lines"); pv.addWidget(self.preview_legend)
+        self.preview_legend = QLabel("Class 0: Background · Green: Drivable · Yellow: Lane lines · Red: Vehicles")
+        self.preview_legend.setWordWrap(True); pv.addWidget(self.preview_legend)
         split.addWidget(preview_box); split.setSizes([520, 650]); layout.addWidget(split, 1)
 
         dash = QGroupBox("Annotation progress"); dv = QGridLayout(dash)
@@ -185,6 +211,63 @@ class MainWindow(QMainWindow):
         tabs.addTab(page_scroll, "YOLOPv2 Teacher Labeling")
         self._rescan_annotations()
 
+    def _populate_town_rows(self, towns):
+        """Rebuild town targets from the CARLA server's installed map list."""
+        previous = {
+            name: {
+                "enabled": row["enabled"].isChecked(),
+                "target": row["target"].value(),
+                "count": row["count"].text(),
+            }
+            for name, row in self.town_rows.items()
+        }
+        while self.town_rows_layout.count():
+            item = self.town_rows_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self.town_rows = {}
+
+        for town in sorted(set(str(name).split("/")[-1] for name in towns)):
+            old = previous.get(town, {})
+            row_widget = QWidget()
+            row = QGridLayout(row_widget)
+            row.setContentsMargins(2, 2, 2, 2)
+            enabled = QCheckBox(town)
+            enabled.setChecked(bool(old.get("enabled", True)))
+            target = self._spin(0, 1_000_000, int(old.get("target", 700)))
+            count = QLabel(old.get("count", f"0 / {target.value()} · Pending"))
+            bar = QProgressBar(); bar.setRange(0, max(1, target.value())); bar.setValue(0)
+            enabled.stateChanged.connect(self._update_totals)
+            target.valueChanged.connect(self._update_totals)
+            row.addWidget(enabled, 0, 0)
+            row.addWidget(QLabel("Target"), 0, 1)
+            row.addWidget(target, 0, 2)
+            row.addWidget(count, 0, 3)
+            row.addWidget(bar, 1, 0, 1, 4)
+            self.town_rows_layout.addWidget(row_widget)
+            self.town_rows[town] = {
+                "enabled": enabled, "target": target, "count": count,
+                "bar": bar, "status": "Pending",
+            }
+        self.town_rows_layout.addStretch(1)
+        self._update_totals()
+
+    def _available_maps(self, maps):
+        """Apply the exact map list returned by the connected CARLA server."""
+        if not maps:
+            return
+        current = self.current_town.text()
+        names = sorted(set(str(name).split("/")[-1] for name in maps))
+        self._populate_town_rows(names)
+        self.logs.appendPlainText(
+            f"Discovered {len(names)} installed CARLA map(s): " + ", ".join(names)
+        )
+        if current and current != "—" and current not in names:
+            self.logs.appendPlainText(
+                f"Current world '{current}' is not in the discovered map list."
+            )
+
     def _choose_model(self):
         path, _ = QFileDialog.getOpenFileName(self, "Choose YOLOPv2 ONNX model", str(Path(self.model_path.text()).parent), "ONNX models (*.onnx)")
         if path:
@@ -200,7 +283,7 @@ class MainWindow(QMainWindow):
         if self.annotation_scan_worker and self.annotation_scan_worker.isRunning():
             return
         self._update_model_availability()
-        root = Path(__file__).resolve().parent / "datasets"
+        root = Path(self.output.text()).expanduser()
         worker = CollectionScanWorker(root, self)
         self.annotation_scan_worker = worker
         worker.result.connect(self._annotations_scanned)
@@ -309,10 +392,28 @@ class MainWindow(QMainWindow):
             predictor = YOLOPv2Predictor(session, size)
             bgr = cv2.imread(path, cv2.IMREAD_COLOR)
             if bgr is None: raise ValueError("Image could not be decoded")
-            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB); drive, lane, combined = predictor.predict(rgb)
-            self._annotation_previews = visualization(rgb, drive, lane, combined)
-            self.preview_dims.setText(f"Original: {rgb.shape[1]}×{rgb.shape[0]} · Drivable/Lane/Combined: {drive.shape[1]}×{drive.shape[0]} · Provider: {provider}")
-            self._refresh_annotation_preview(); self.annotation_logs.appendPlainText(f"Previewed {path}; provider {provider}, input {size[0]}×{size[1]}.")
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            result = predictor.predict_full(
+                rgb,
+                annotate_vehicles=self.annotate_vehicles.isChecked(),
+                score_threshold=self.vehicle_confidence.value(),
+                iou_threshold=self.vehicle_nms.value(),
+                mask_method=self.vehicle_mask_method.currentData(),
+            )
+            self._annotation_previews = visualization(
+                rgb, result["drive"], result["lane"], result["combined"],
+                vehicle=result["vehicle"], detections=result["detections"],
+            )
+            self.preview_dims.setText(
+                f"Original: {rgb.shape[1]}×{rgb.shape[0]} · "
+                f"Vehicles: {len(result['detections'])} · "
+                f"GrabCut box fallbacks: {result['vehicle_mask_fallbacks']} · Provider: {provider}"
+            )
+            self._refresh_annotation_preview()
+            self.annotation_logs.appendPlainText(
+                f"Previewed {path}; provider {provider}, input {size[0]}×{size[1]}, "
+                f"vehicle detections {len(result['detections'])}."
+            )
             output_text = "; ".join(f"{o.name} {o.shape}" for o in session.get_outputs())
             self.provider_info.setText(f"Available: {available} · preview provider: {provider} · input: {size[0]}×{size[1]} · outputs: {output_text}")
             if fallback_message: self.annotation_logs.appendPlainText(fallback_message)
@@ -334,7 +435,16 @@ class MainWindow(QMainWindow):
         if self.reprocess.isChecked():
             answer = QMessageBox.warning(self, "Overwrite existing annotations?", "Reprocessing will overwrite existing masks for selected images. Continue?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
             if answer != QMessageBox.Yes: return
-        self.annotation_worker = AnnotationWorker(jobs, model, self.provider_combo.currentText(), self.save_vis.isChecked(), self.reprocess.isChecked())
+        selected_vehicle_classes = (2, 3, 5, 7) if self.annotate_vehicles.isChecked() else ()
+        self.annotation_worker = AnnotationWorker(
+            jobs, model, self.provider_combo.currentText(),
+            self.save_vis.isChecked(), self.reprocess.isChecked(),
+            annotate_vehicles=self.annotate_vehicles.isChecked(),
+            vehicle_score_threshold=self.vehicle_confidence.value(),
+            vehicle_nms_threshold=self.vehicle_nms.value(),
+            vehicle_class_ids=selected_vehicle_classes,
+            vehicle_mask_method=self.vehicle_mask_method.currentData(),
+        )
         w = self.annotation_worker
         w.log.connect(self.annotation_logs.appendPlainText); w.progress.connect(self._annotation_progress)
         w.preview.connect(self._annotation_batch_preview); w.done.connect(self._annotation_done)
@@ -385,8 +495,14 @@ class MainWindow(QMainWindow):
         if data.get("model_info"): self.model_info.setText(data["model_info"])
 
     def _annotation_batch_preview(self, payload):
-        self._annotation_previews = visualization(payload["rgb"], payload["drive"], payload["lane"], payload["combined"])
-        self.preview_dims.setText(f"Original and masks: {payload['dims'][0]}×{payload['dims'][1]} · {payload['path']}")
+        self._annotation_previews = visualization(
+            payload["rgb"], payload["drive"], payload["lane"], payload["combined"],
+            vehicle=payload.get("vehicle"), detections=payload.get("detections"),
+        )
+        self.preview_dims.setText(
+            f"Original and masks: {payload['dims'][0]}×{payload['dims'][1]} · "
+            f"vehicles {len(payload.get('detections', []))} · {payload['path']}"
+        )
         self._refresh_annotation_preview()
 
     def _annotation_done(self, stats):
@@ -396,7 +512,12 @@ class MainWindow(QMainWindow):
         elif stats.get("error"):
             self.annotation_logs.appendPlainText(f"Annotation failed: {stats['error']}")
         else:
-            self.annotation_logs.appendPlainText(f"Annotation finished. Successful: {stats.get('success',0)}, skipped: {stats.get('skipped',0)}, failed: {stats.get('failed',0)}.")
+            self.annotation_logs.appendPlainText(
+                f"Annotation finished. Successful: {stats.get('success',0)}, "
+                f"skipped: {stats.get('skipped',0)}, failed: {stats.get('failed',0)}, "
+                f"vehicle detections: {stats.get('vehicle_detections',0)}, "
+                f"GrabCut box fallbacks: {stats.get('vehicle_fallbacks',0)}."
+            )
         self.annotate_start.setEnabled(True); self.annotate_pause.setEnabled(False); self.annotate_resume.setEnabled(False); self.annotate_stop.setEnabled(False)
         self._rescan_annotations()
 
@@ -440,6 +561,7 @@ class MainWindow(QMainWindow):
         if self.worker and self.worker.isRunning(): return
         self.worker=CarlaWorker(self._config(),connect_only)
         self.worker.status.connect(self._status); self.worker.log.connect(self._log); self.worker.progress.connect(self._progress); self.worker.preview.connect(self._preview)
+        self.worker.maps_available.connect(self._available_maps)
         self.worker.finished_result.connect(self._finished)
         self.worker.start()
 

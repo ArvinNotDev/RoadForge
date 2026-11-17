@@ -8,6 +8,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
+from .config import DEFAULT_CLASSES
 from .dataset import Sample
 
 
@@ -237,8 +238,8 @@ def prepare_dataset(
                         ignored_pixel_count += int(pixel_count)
 
             class_distribution[part] = {
-                "pixel_counts": {i: pixel_counts.get(i, 0) for i in range(3)},
-                "image_counts": {i: image_counts.get(i, 0) for i in range(3)},
+                "pixel_counts": {i: pixel_counts.get(i, 0) for i in DEFAULT_CLASSES},
+                "image_counts": {i: image_counts.get(i, 0) for i in DEFAULT_CLASSES},
                 "ignored_pixel_count": ignored_pixel_count,
             }
 
@@ -256,7 +257,8 @@ def prepare_dataset(
 
         counts = {"train": len(split.train), "val": len(split.val), "test": len(split.test)}
         manifest = {
-            "format_version": 2,
+            "format_version": 3,
+            "class_map": {str(key): value for key, value in DEFAULT_CLASSES.items()},
             "seed": seed,
             "strategy": "collection_session",
             "holdout_towns": sorted(map(str, holdout_towns)),
@@ -287,7 +289,9 @@ def prepare_dataset(
                 warnings.append(f"{part} split contains no pixels for: {', '.join(absent)}")
 
         dataset_report = {
-            "format_version": 2,
+            "format_version": 3,
+            "num_classes": len(DEFAULT_CLASSES),
+            "class_map": {str(key): value for key, value in DEFAULT_CLASSES.items()},
             "samples": len(report.valid),
             "counts": counts,
             "actual_ratios": actual_ratios,
