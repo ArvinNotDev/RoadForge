@@ -6,8 +6,13 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-CONFIG_VERSION = 2
-DEFAULT_CLASSES = {0: "background", 1: "ego_drivable_area", 2: "lane_lines"}
+CONFIG_VERSION = 3
+DEFAULT_CLASSES = {
+    0: "background",
+    1: "ego_drivable_area",
+    2: "lane_lines",
+    3: "vehicles",
+}
 
 
 def default_config(project_root: Path) -> dict[str, Any]:
@@ -77,6 +82,12 @@ def migrate_config(data: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Model class IDs must be integers.") from exc
     if not normalized_classes or sorted(normalized_classes) != list(range(len(normalized_classes))):
         raise ValueError("Model class IDs must be contiguous and start at 0.")
+
+    # Configs created by the previous RoadForge schema contain the original
+    # three semantic classes. Keep their values and append the new vehicle class
+    # rather than forcing users to recreate settings/presets.
+    if version < 3 and sorted(normalized_classes) == [0, 1, 2]:
+        normalized_classes[3] = "vehicles"
     model["classes"] = normalized_classes
     model.setdefault("task", "semantic")
     migrated["model"] = model
