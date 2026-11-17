@@ -644,7 +644,8 @@ class AnnotationWorker(QThread):
                 self.log.emit(
                     "Vehicle teacher enabled · COCO classes: "
                     + ", ".join(COCO_VEHICLE_CLASSES.get(value, str(value)) for value in self.vehicle_class_ids)
-                    + f" · confidence {self.vehicle_score_threshold:.2f} · NMS {self.vehicle_nms_threshold:.2f} · mask {self.vehicle_mask_method}"
+                    + f" · confidence {self.vehicle_score_threshold:.2f} · NMS {self.vehicle_nms_threshold:.2f} · "
+                    + f"bottom excluded {(1.0 - self.vehicle_bottom_keep_ratio) * 100:.0f}% · mask {self.vehicle_mask_method}"
                 )
             else:
                 self.log.emit("Vehicle teacher disabled; new masks will contain an empty vehicles class.")
