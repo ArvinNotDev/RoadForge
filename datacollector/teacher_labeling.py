@@ -193,6 +193,11 @@ def create_session(model_path, provider="Auto"):
 
 COCO_VEHICLE_CLASSES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
 DEFAULT_VEHICLE_CLASS_IDS = tuple(COCO_VEHICLE_CLASSES)
+DEFAULT_VEHICLE_SCORE_THRESHOLD = 0.50
+DEFAULT_VEHICLE_NMS_THRESHOLD = 0.40
+# Ignore the bottom 22% of the camera image for vehicle detections to exclude
+# the ego-vehicle hood. Boxes crossing the boundary are clipped, not discarded.
+DEFAULT_VEHICLE_BOTTOM_KEEP_RATIO = 0.78
 
 
 def _sigmoid(values):
@@ -238,10 +243,11 @@ def decode_vehicle_detections(
     outputs,
     input_size,
     original_size,
-    score_threshold=0.30,
-    iou_threshold=0.45,
+    score_threshold=DEFAULT_VEHICLE_SCORE_THRESHOLD,
+    iou_threshold=DEFAULT_VEHICLE_NMS_THRESHOLD,
     vehicle_class_ids=DEFAULT_VEHICLE_CLASS_IDS,
     max_detections=300,
+    bottom_keep_ratio=DEFAULT_VEHICLE_BOTTOM_KEEP_RATIO,
 ):
     """Decode YOLOPv2's three anchor heads and return COCO vehicle boxes.
 
@@ -257,6 +263,9 @@ def decode_vehicle_detections(
         raise ValueError("Vehicle confidence threshold must be between 0 and 1.")
     if not 0.0 <= iou_threshold <= 1.0:
         raise ValueError("Vehicle NMS IoU threshold must be between 0 and 1.")
+    bottom_keep_ratio = float(bottom_keep_ratio)
+    if not 0.0 < bottom_keep_ratio <= 1.0:
+        raise ValueError("Vehicle bottom keep ratio must be greater than 0 and at most 1.")
 
     input_width, input_height = map(int, input_size)
     original_width, original_height = map(int, original_size)
@@ -307,6 +316,24 @@ def decode_vehicle_detections(
     boxes[:, 2] = xywh[:, 0] + xywh[:, 2] / 2.0
     boxes[:, 3] = xywh[:, 1] + xywh[:, 3] / 2.0
 
+    # Exclude the lower image strip from vehicle detections before NMS so an
+    # ego-hood false positive cannot suppress a valid vehicle box. A box that
+    # crosses the cutoff is retained but clipped to the visible upper region.
+    bottom_cutoff = input_height * bottom_keep_ratio
+    keep = boxes[:, 1] < bottom_cutoff
+    boxes = boxes[keep].copy()
+    scores = scores[keep]
+    class_ids = class_ids[keep]
+    if boxes.size == 0:
+        return []
+    boxes[:, 3] = np.minimum(boxes[:, 3], bottom_cutoff)
+    keep = boxes[:, 3] > boxes[:, 1]
+    boxes = boxes[keep]
+    scores = scores[keep]
+    class_ids = class_ids[keep]
+    if boxes.size == 0:
+        return []
+
     # Class-aware NMS prevents a nearby car and bus from suppressing each other.
     kept = []
     for class_id in sorted(set(class_ids.tolist())):
@@ -336,12 +363,19 @@ def decode_vehicle_detections(
     scale_x = original_width / float(input_width)
     scale_y = original_height / float(input_height)
     result = []
+    original_bottom_cutoff = max(
+        1, min(original_height, int(round(original_height * bottom_keep_ratio)))
+    )
     for index in kept[:max(1, int(max_detections))]:
         x1, y1, x2, y2 = boxes[index]
         x1 = int(np.clip(round(float(x1) * scale_x), 0, original_width - 1))
         y1 = int(np.clip(round(float(y1) * scale_y), 0, original_height - 1))
+        if y1 >= original_bottom_cutoff:
+            continue
         x2 = int(np.clip(round(float(x2) * scale_x), x1 + 1, original_width))
-        y2 = int(np.clip(round(float(y2) * scale_y), y1 + 1, original_height))
+        y2 = int(np.clip(
+            round(float(y2) * scale_y), y1 + 1, original_bottom_cutoff
+        ))
         result.append({
             "bbox": (x1, y1, x2, y2),
             "score": float(scores[index]),
@@ -458,9 +492,12 @@ class YOLOPv2Predictor:
             raise RuntimeError(f"Expected verified YOLOPv2 six-output graph, found {len(self.outputs)}")
 
     def predict_full(
-        self, rgb, *, annotate_vehicles=True, score_threshold=0.30,
-        iou_threshold=0.45, vehicle_class_ids=DEFAULT_VEHICLE_CLASS_IDS,
+        self, rgb, *, annotate_vehicles=True,
+        score_threshold=DEFAULT_VEHICLE_SCORE_THRESHOLD,
+        iou_threshold=DEFAULT_VEHICLE_NMS_THRESHOLD,
+        vehicle_class_ids=DEFAULT_VEHICLE_CLASS_IDS,
         mask_method="grabcut",
+        bottom_keep_ratio=DEFAULT_VEHICLE_BOTTOM_KEEP_RATIO,
     ):
         h, w = rgb.shape[:2]
         # Keep the existing direct-resize RGB preprocessing unchanged for the
@@ -503,6 +540,7 @@ class YOLOPv2Predictor:
             detections = decode_vehicle_detections(
                 outputs, (self.input_width, self.input_height), (w, h),
                 score_threshold, iou_threshold, vehicle_class_ids,
+                bottom_keep_ratio=bottom_keep_ratio,
             )
             vehicle_mask, fallback_count = build_vehicle_mask(
                 rgb, detections, mask_method=mask_method,
@@ -568,8 +606,10 @@ class AnnotationWorker(QThread):
     def __init__(
         self, jobs, model_path, provider="Auto", save_visualizations=True,
         reprocess=False, preview_interval=1, annotate_vehicles=True,
-        vehicle_score_threshold=0.30, vehicle_nms_threshold=0.45,
+        vehicle_score_threshold=DEFAULT_VEHICLE_SCORE_THRESHOLD,
+        vehicle_nms_threshold=DEFAULT_VEHICLE_NMS_THRESHOLD,
         vehicle_class_ids=DEFAULT_VEHICLE_CLASS_IDS, vehicle_mask_method="grabcut",
+        vehicle_bottom_keep_ratio=DEFAULT_VEHICLE_BOTTOM_KEEP_RATIO,
     ):
         super().__init__()
         self.jobs = jobs
@@ -583,6 +623,7 @@ class AnnotationWorker(QThread):
         self.vehicle_nms_threshold = float(vehicle_nms_threshold)
         self.vehicle_class_ids = tuple(int(value) for value in vehicle_class_ids)
         self.vehicle_mask_method = str(vehicle_mask_method)
+        self.vehicle_bottom_keep_ratio = float(vehicle_bottom_keep_ratio)
         self._pause = threading.Event()
         self._pause.set()
         self._stop = threading.Event()
@@ -686,6 +727,7 @@ class AnnotationWorker(QThread):
                         iou_threshold=self.vehicle_nms_threshold,
                         vehicle_class_ids=self.vehicle_class_ids,
                         mask_method=self.vehicle_mask_method,
+                        bottom_keep_ratio=self.vehicle_bottom_keep_ratio,
                     )
                     drive = result["drive"]
                     lane = result["lane"]
@@ -725,6 +767,8 @@ class AnnotationWorker(QThread):
                             "class_names": [COCO_VEHICLE_CLASSES.get(value, str(value)) for value in self.vehicle_class_ids],
                             "confidence_threshold": self.vehicle_score_threshold,
                             "nms_iou_threshold": self.vehicle_nms_threshold,
+                            "bottom_keep_height_ratio": self.vehicle_bottom_keep_ratio,
+                            "bottom_excluded_height_ratio": 1.0 - self.vehicle_bottom_keep_ratio,
                             "mask_method": self.vehicle_mask_method,
                             "detection_count": len(detections),
                             "grabcut_box_fallbacks": int(result["vehicle_mask_fallbacks"]),
