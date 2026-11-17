@@ -340,12 +340,20 @@ def run_image_inference(model_path: str, image_path: str, output_dir: str, imgsz
     output.mkdir(parents=True, exist_ok=True)
     stem = image_path.stem
     mask_path, overlay_path = output / f"{stem}_mask.png", output / f"{stem}_overlay.png"
-    drive_path, lane_path = output / f"{stem}_drivable.png", output / f"{stem}_lane_lines.png"
+    drive_path = output / f"{stem}_drivable.png"
+    lane_path = output / f"{stem}_lane_lines.png"
+    vehicles_path = output / f"{stem}_vehicles.png"
     Image.fromarray(predicted).save(mask_path)
     Image.fromarray(overlay(rgb, predicted, opacity)).save(overlay_path)
     Image.fromarray((predicted == 1).astype(np.uint8) * 255).save(drive_path)
     Image.fromarray((predicted == 2).astype(np.uint8) * 255).save(lane_path)
-    return {"image": str(image_path), "mask": str(mask_path), "overlay": str(overlay_path), "drivable": str(drive_path), "lane_lines": str(lane_path), "classes_present": sorted(map(int, np.unique(predicted)))}
+    Image.fromarray((predicted == 3).astype(np.uint8) * 255).save(vehicles_path)
+    return {
+        "image": str(image_path), "mask": str(mask_path), "overlay": str(overlay_path),
+        "drivable": str(drive_path), "lane_lines": str(lane_path),
+        "vehicles": str(vehicles_path),
+        "classes_present": sorted(map(int, np.unique(predicted))),
+    }
 
 
 def run_folder_inference(model_path: str, folder: str, output_dir: str, imgsz: int = 512, device: str = "auto", opacity: float = 0.42, progress=None) -> dict:
@@ -396,6 +404,7 @@ def run_folder_inference(model_path: str, folder: str, output_dir: str, imgsz: i
         Image.fromarray(overlay(rgb, prediction, opacity)).save(target_dir / f"{output_stem}_overlay.png")
         Image.fromarray((prediction == 1).astype(np.uint8) * 255).save(target_dir / f"{output_stem}_drivable.png")
         Image.fromarray((prediction == 2).astype(np.uint8) * 255).save(target_dir / f"{output_stem}_lane_lines.png")
+        Image.fromarray((prediction == 3).astype(np.uint8) * 255).save(target_dir / f"{output_stem}_vehicles.png")
         if progress:
             progress(index, len(images), path.name)
     return {"processed": len(images), "output_dir": str(output), "model": str(Path(model_path).resolve())}
