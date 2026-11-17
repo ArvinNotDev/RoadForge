@@ -186,5 +186,20 @@ def test_four_class_annotation_validator_accepts_vehicle_lane_overlap(tmp_path):
         "width": width,
         "height": height,
         "class_map": {"0": "background", "1": "ego_drivable_area", "2": "lane_lines", "3": "vehicles"},
+        "vehicle_annotation": {
+            "pipeline_version": teacher.DEFAULT_VEHICLE_ANNOTATION_PIPELINE_VERSION,
+            "confidence_threshold": 0.50,
+            "nms_iou_threshold": 0.40,
+            "bottom_keep_height_ratio": 0.78,
+        },
     }
     assert teacher.annotation_outputs_valid(tmp_path, record)
+
+    # Existing four-class labels without the new filter version must be marked
+    # stale so the annotation worker regenerates them using the current defaults.
+    legacy_record = dict(record)
+    legacy_record["vehicle_annotation"] = {
+        "confidence_threshold": 0.30,
+        "nms_iou_threshold": 0.45,
+    }
+    assert not teacher.annotation_outputs_valid(tmp_path, legacy_record)
