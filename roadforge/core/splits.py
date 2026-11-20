@@ -180,6 +180,7 @@ def prepare_dataset(
     # Assign every original sample to a leakage-aware split before downsampling.
     # This prevents quality ranking from making validation/test artificially easy.
     source_split = split_samples(report.valid, ratios, seed, holdout_towns)
+    selected_samples = report.valid
     selection_scores: dict[int, float] = {}
     if max_samples is None:
         selection_report = {

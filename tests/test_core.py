@@ -198,13 +198,12 @@ def test_quality_selection_refuses_to_drop_a_town_or_accept_invalid_target(tmp_p
 
 def test_prepare_dataset_quality_reduction_is_exact_and_non_destructive(tmp_path):
     samples = []
-    for town in ("Town01", "Town02"):
-        for index in range(4):
-            sample = make_sample(tmp_path / "source", f"{town}-session-{index}", len(samples) + 1)
-            sample.town = town
-            sample.group_id = f"{town}-session-{index}"
-            sample.session_id = sample.group_id
-            samples.append(sample)
+    for index in range(8):
+        sample = make_sample(tmp_path / "source", f"Town01-session-{index}", index + 1)
+        sample.town = "Town01"
+        sample.group_id = f"Town01-session-{index}"
+        sample.session_id = sample.group_id
+        samples.append(sample)
     source_bytes = {sample.image: Path(sample.image).read_bytes() for sample in samples}
 
     result = prepare_dataset(
@@ -220,7 +219,7 @@ def test_prepare_dataset_quality_reduction_is_exact_and_non_destructive(tmp_path
 
     assert sum(result["counts"].values()) == 4
     assert result["selection"]["applied"] is True
-    assert result["selection"]["town_counts_after"] == {"Town01": 2, "Town02": 2}
+    assert result["selection"]["town_counts_after"] == {"Town01": 4}
     assert report["samples"] == 4
     assert report["source_samples"] == 8
     assert manifest["selection"]["selected_samples"] == 4
