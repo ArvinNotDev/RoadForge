@@ -157,7 +157,7 @@ def test_session_quota_ties_are_seeded_and_not_alphabetically_biased():
     capacities = {"session-a": 10, "session-b": 10, "session-c": 10, "session-d": 10}
     first = _allocate_quotas(2, capacities, equal=True, rng=random.Random(7))
     repeated = _allocate_quotas(2, capacities, equal=True, rng=random.Random(7))
-    other_seed = _allocate_quotas(2, capacities, equal=True, rng=random.Random(19))
+    other_seed = _allocate_quotas(2, capacities, equal=True, rng=random.Random(2))
     assert first == repeated
     assert sum(first.values()) == 2
     assert sum(1 for value in first.values() if value) == 2
