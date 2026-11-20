@@ -341,6 +341,36 @@ class MainWindow(QMainWindow):
         self.prepare_button = button("Prepare dataset copy…", self.prepare_selected, primary=True)
         split_form.addWidget(self.prepare_button)
         layout.addWidget(split_box)
+
+        reduction_box = QGroupBox("Optional quality-aware dataset reduction")
+        reduction_row = QHBoxLayout(reduction_box)
+        self.downsample_enabled = QCheckBox("Limit prepared dataset to")
+        self.downsample_enabled.setToolTip(
+            "Build a smaller prepared copy using image sharpness, contrast, exposure, mask coverage, "
+            "and rare-class support. This heuristic does not verify pseudo-label correctness."
+        )
+        self.downsample_count = QSpinBox()
+        self.downsample_count.setRange(1, 2_147_483_647)
+        self.downsample_count.setValue(7000)
+        self.downsample_count.setSuffix(" samples")
+        self.downsample_count.setEnabled(False)
+        self.balance_towns = QCheckBox("Balance towns/maps and collection sessions")
+        self.balance_towns.setChecked(True)
+        self.balance_towns.setEnabled(False)
+        self.downsample_enabled.toggled.connect(self.downsample_count.setEnabled)
+        self.downsample_enabled.toggled.connect(self.balance_towns.setEnabled)
+        reduction_row.addWidget(self.downsample_enabled)
+        reduction_row.addWidget(self.downsample_count)
+        reduction_row.addWidget(self.balance_towns)
+        reduction_hint = QLabel(
+            "Ranks image/mask quality, then allocates samples across towns and sessions. "
+            "Only the new prepared copy is reduced; original collections and masks are never changed."
+        )
+        reduction_hint.setObjectName("Muted")
+        reduction_hint.setWordWrap(True)
+        reduction_row.addWidget(reduction_hint, 1)
+        layout.addWidget(reduction_box)
+
         self.prepared_status = QLabel("Prepared dataset output is written only under the Studio workspace.")
         self.prepared_status.setObjectName("Muted")
         layout.addWidget(self.prepared_status)
@@ -616,6 +646,11 @@ class MainWindow(QMainWindow):
             self.val_ratio.setValue(float(split.get("val", 0.1)) * 100)
             self.test_ratio.setValue(float(split.get("test", 0.1)) * 100)
             self.split_seed.setValue(int(split.get("seed", 42)))
+            self.downsample_enabled.setChecked(bool(split.get("selection_enabled", False)))
+            self.downsample_count.setValue(int(split.get("max_samples", 7000)))
+            self.balance_towns.setChecked(bool(split.get("balance_towns", True)))
+            self.downsample_count.setEnabled(self.downsample_enabled.isChecked())
+            self.balance_towns.setEnabled(self.downsample_enabled.isChecked())
         inference = self.config.get("inference", {})
         if hasattr(self, "test_imgsz"):
             self.test_imgsz.setValue(int(inference.get("imgsz", 512)))
@@ -859,11 +894,28 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Invalid dataset name", str(exc)); return
         output = Path(self.config.get("workspace", "")) / "prepared_datasets" / dataset_name
         holdout = self._checked_values(self.holdout_towns)
-        summary = f"Pairs: {len(self.validation_report.valid):,}\nTrain / validation / test: {ratios}\nGrouping: whole collection session, with exact duplicate images kept together\nHeld-out test towns: {sorted(holdout) or 'none'}\nOutput: {output}\n\nContinue with a new prepared copy?"
+        max_samples = self.downsample_count.value() if self.downsample_enabled.isChecked() else None
+        balance_towns = self.balance_towns.isChecked()
+        reduction_summary = (
+            f"Quality-aware limit: {max_samples:,} samples; "
+            f"{'equal town/session quotas' if balance_towns else 'source-proportional town/session quotas'}"
+            if max_samples is not None else "Quality-aware reduction: disabled (use every valid pair)"
+        )
+        summary = (
+            f"Valid pairs: {len(self.validation_report.valid):,}\n{reduction_summary}\n"
+            f"Train / validation / test: {ratios}\n"
+            "Grouping: whole collection session, with exact duplicate images kept together\n"
+            f"Held-out test towns: {sorted(holdout) or 'none'}\nOutput: {output}\n\n"
+            "Create a separate prepared copy? Source collections will remain unchanged."
+        )
         if QMessageBox.question(self, "Prepare dataset", summary) != QMessageBox.StandardButton.Yes:
             return
         self.prepare_button.setEnabled(False)
-        self._start_operation("Dataset preparation", prepare_dataset, self.validation_report.valid, output, ratios, self.split_seed.value(), False, 255 if self.ignore_checkbox.isChecked() else None, holdout, on_done=self._prepared_done)
+        self._start_operation(
+            "Dataset preparation", prepare_dataset, self.validation_report.valid, output, ratios,
+            self.split_seed.value(), False, 255 if self.ignore_checkbox.isChecked() else None, holdout,
+            max_samples=max_samples, balance_towns=balance_towns, on_done=self._prepared_done,
+        )
 
     def _prepared_done(self, result):
         self.prepared_dataset = result["path"]
@@ -871,9 +923,17 @@ class MainWindow(QMainWindow):
         self.data_yaml_edit.setText(self.data_yaml)
         self.eval_dataset.setText(self.prepared_dataset)
         self.config.setdefault("dataset", {}).update({"data_yaml": self.data_yaml, "prepared_dataset": self.prepared_dataset})
-        self.prepared_status.setText(f"Prepared copy: {self.prepared_dataset} · {result['counts']} · warnings: {result['report']['warnings'] or 'none'}")
+        selection = result.get("selection", {})
+        reduction = (
+            f" · selected {selection.get('selected_samples', 0):,}/{selection.get('available_samples', 0):,}"
+            if selection.get("enabled") else ""
+        )
+        self.prepared_status.setText(
+            f"Prepared copy: {self.prepared_dataset} · {result['counts']}{reduction} · "
+            f"warnings: {result['report']['warnings'] or 'none'}"
+        )
         self.prepare_button.setEnabled(True)
-        self._append_log(f"Prepared dataset with split counts {result['counts']}")
+        self._append_log(f"Prepared dataset with split counts {result['counts']} and selection report {selection}")
 
     def _choose_data_yaml(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select semantic dataset YAML", str(Path(self.config.get("workspace", APP_DIR))), "YAML (*.yaml *.yml)")
@@ -945,6 +1005,9 @@ class MainWindow(QMainWindow):
             "seed": self.split_seed.value(),
             "strategy": "collection_session",
             "holdout_towns": sorted(self._checked_values(self.holdout_towns)) if self.holdout_towns.count() else list(config.get("split", {}).get("holdout_towns", [])),
+            "selection_enabled": self.downsample_enabled.isChecked(),
+            "max_samples": self.downsample_count.value(),
+            "balance_towns": self.balance_towns.isChecked(),
         }
         config["inference"] = {
             **config.get("inference", {}),

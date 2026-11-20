@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .config import DEFAULT_CLASSES
 from .dataset import Sample
+from .selection import select_quality_balanced_samples
 
 
 @dataclass
@@ -148,6 +149,7 @@ def _sample_output_stem(sample: Sample) -> str:
 def prepare_dataset(
     samples: list[Sample], output_root: str | Path, ratios: dict[str, float], seed: int = 42,
     replace_existing: bool = False, ignore_label: int | None = None, holdout_towns=(),
+    max_samples: int | None = None, balance_towns: bool = True, progress=None,
 ) -> dict:
     """Copy valid image/mask pairs into Ultralytics' semantic PNG-mask layout.
 
@@ -175,7 +177,21 @@ def prepare_dataset(
     if not report.valid:
         raise ValueError("No valid image-mask pairs are available.")
 
-    split = split_samples(report.valid, ratios, seed, holdout_towns)
+    selected_samples = report.valid
+    selection_scores: dict[str, float] = {}
+    if max_samples is None:
+        selection_report = {
+            "enabled": False, "applied": False,
+            "method": "quality_stratified_town_session_v1",
+            "available_samples": len(report.valid),
+            "selected_samples": len(report.valid),
+        }
+    else:
+        selected_samples, selection_report, selection_scores = select_quality_balanced_samples(
+            report.valid, max_samples, seed=seed, balance_towns=balance_towns, progress=progress
+        )
+
+    split = split_samples(selected_samples, ratios, seed, holdout_towns)
     target = Path(output_root).expanduser().resolve()
     if target.exists() and not target.is_dir():
         raise NotADirectoryError(f"Prepared dataset destination is not a directory: {target}")
@@ -225,6 +241,8 @@ def prepare_dataset(
                     "weather": sample.weather,
                     "traffic": sample.traffic,
                 }
+                if sample.image in selection_scores:
+                    row["selection_quality_score"] = round(selection_scores[sample.image], 6)
                 split_rows[part].append(row)
 
                 with Image.open(mask_source) as image_mask:
@@ -263,6 +281,7 @@ def prepare_dataset(
             "strategy": "collection_session",
             "holdout_towns": sorted(map(str, holdout_towns)),
             "ignore_label": ignore_label,
+            "selection": selection_report,
             "ratios": {key: float(value) for key, value in ratios.items()},
             "counts": counts,
             "class_distribution": class_distribution,
@@ -292,12 +311,14 @@ def prepare_dataset(
             "format_version": 3,
             "num_classes": len(DEFAULT_CLASSES),
             "class_map": {str(key): value for key, value in DEFAULT_CLASSES.items()},
-            "samples": len(report.valid),
+            "samples": len(selected_samples),
+            "source_samples": len(report.valid),
             "counts": counts,
             "actual_ratios": actual_ratios,
             "class_distribution": class_distribution,
             "holdout_towns": sorted(map(str, holdout_towns)),
             "ignore_label": ignore_label,
+            "selection": selection_report,
             "group_count": len(split.group_assignment),
             "warnings": warnings,
             "source_validation": {
@@ -318,6 +339,7 @@ def prepare_dataset(
         "path": str(target),
         "data_yaml": str(data_yaml),
         "counts": counts,
+        "selection": selection_report,
         "groups": split.group_assignment,
         "manifest": manifest,
         "report": dataset_report,

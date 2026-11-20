@@ -41,7 +41,8 @@ def default_config(project_root: Path) -> dict[str, Any]:
             "copy_paste": 0.0, "ignore_label": None,
         },
         "split": {"train": 0.8, "val": 0.1, "test": 0.1, "seed": 42,
-                  "strategy": "collection_session", "holdout_towns": []},
+                  "strategy": "collection_session", "holdout_towns": [],
+                  "selection_enabled": False, "max_samples": 7000, "balance_towns": True},
         "inference": {"conf": 0.25, "overlay_opacity": 0.42, "provider": "auto", "imgsz": 512},
         "export": {"format": "onnx", "imgsz": 512, "opset": 17, "dynamic": False, "simplify": False},
     }
