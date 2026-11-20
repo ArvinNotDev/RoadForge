@@ -11,6 +11,7 @@ from roadforge.core.metrics import confusion_matrix, metrics_from_confusion
 from roadforge.core.runtime import _DEPLOYMENT_INFERENCE_SCRIPT, _dataset_manifest_file, _semantic_array_to_mask, evaluate_dataset, run_folder_inference
 from roadforge.core.registry import list_models, register_model, remove_model
 from roadforge.core.splits import prepare_dataset, split_samples
+from roadforge.core.selection import select_quality_balanced_samples
 
 
 def make_sample(tmp_path: Path, group: str, index: int, mask_values=None) -> Sample:
@@ -120,6 +121,77 @@ def test_prepare_copies_data_yaml_and_preserves_source(tmp_path):
     assert result["report"]["num_classes"] == 4
     assert (Path(result["path"]) / "dataset_report.json").is_file()
     assert all(Path(sample.image).read_bytes() == original_bytes[sample.image] for sample in samples)
+
+
+def test_quality_selection_is_deterministic_and_balances_towns_and_sessions(tmp_path):
+    samples = []
+    for town in ("Town01", "Town02"):
+        for session in range(3):
+            for frame in range(2):
+                index = len(samples) + 1
+                sample = make_sample(tmp_path / "source", f"{town}-session-{session}", index)
+                sample.town = town
+                sample.group_id = f"{town}-session-{session}"
+                sample.session_id = sample.group_id
+                samples.append(sample)
+
+    first, report, scores = select_quality_balanced_samples(samples, 6, seed=19, balance_towns=True)
+    second, second_report, _ = select_quality_balanced_samples(samples, 6, seed=19, balance_towns=True)
+
+    assert len(first) == 6
+    assert [sample.image for sample in first] == [sample.image for sample in second]
+    assert report == second_report
+    assert report["town_counts_after"] == {"Town01": 3, "Town02": 3}
+    assert len(scores) == 6
+    assert report["class_images_after"]["1"] > 0
+    assert report["class_images_after"]["2"] > 0
+    assert report["class_images_after"]["3"] > 0
+    for town in ("Town01", "Town02"):
+        selected_sessions = {sample.group_id for sample in first if sample.town == town}
+        assert len(selected_sessions) == 3
+
+
+def test_quality_selection_refuses_to_drop_a_town_or_accept_invalid_target(tmp_path):
+    first = make_sample(tmp_path, "a", 1)
+    second = make_sample(tmp_path, "b", 2)
+    second.town = "Town02"
+    with pytest.raises(ValueError, match="smaller than the number of selected towns"):
+        select_quality_balanced_samples([first, second], 1)
+    with pytest.raises(ValueError, match="positive integer"):
+        select_quality_balanced_samples([first, second], 0)
+
+
+def test_prepare_dataset_quality_reduction_is_exact_and_non_destructive(tmp_path):
+    samples = []
+    for town in ("Town01", "Town02"):
+        for index in range(4):
+            sample = make_sample(tmp_path / "source", f"{town}-session-{index}", len(samples) + 1)
+            sample.town = town
+            sample.group_id = f"{town}-session-{index}"
+            sample.session_id = sample.group_id
+            samples.append(sample)
+    source_bytes = {sample.image: Path(sample.image).read_bytes() for sample in samples}
+
+    result = prepare_dataset(
+        samples,
+        tmp_path / "prepared" / "reduced",
+        {"train": 0.5, "val": 0.25, "test": 0.25},
+        seed=23,
+        max_samples=4,
+        balance_towns=True,
+    )
+    manifest = json.loads((Path(result["path"]) / "split_manifest.json").read_text(encoding="utf-8"))
+    report = json.loads((Path(result["path"]) / "dataset_report.json").read_text(encoding="utf-8"))
+
+    assert sum(result["counts"].values()) == 4
+    assert result["selection"]["applied"] is True
+    assert result["selection"]["town_counts_after"] == {"Town01": 2, "Town02": 2}
+    assert report["samples"] == 4
+    assert report["source_samples"] == 8
+    assert manifest["selection"]["selected_samples"] == 4
+    assert sum(len(rows) for rows in manifest["samples"].values()) == 4
+    assert all(Path(path).read_bytes() == content for path, content in source_bytes.items())
+    assert len(list((Path(result["path"]) / "images").glob("*/*"))) == 4
 
 
 def test_metrics_include_foreground_and_handle_ignore_label():

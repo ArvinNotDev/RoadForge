@@ -16,7 +16,8 @@ The application provides tooling for building the data pipeline and recording ex
 2. **Collect raw RGB first.** Keep acquisition independent of annotation and model training. Preserve `collection_manifest.json` and per-frame metadata.
 3. **Generate teacher labels offline.** Record the teacher checkpoint/ONNX file identity, ONNX Runtime provider, input dimensions, and post-processing configuration. Inspect representative overlays and masks before using the labels.
 4. **Audit the dataset.** Review missing/corrupt pairs, dimensions, allowed class IDs, empty masks, duplicate names, duplicate image hashes, and per-class pixel distributions. Export the full JSON report.
-5. **Create leakage-aware splits.** Use the collection-session grouping strategy and an explicit random seed. For a stronger domain-shift experiment, reserve one or more entire towns for the test set.
+5. **Optionally reduce the prepared sample count.** Use RoadForge's quality-aware selector when training cost requires a smaller subset. It ranks sharpness, contrast, exposure, mask coverage, and rare-class support within each town, then allocates samples across towns and collection sessions. Keep town balancing enabled when the original collection is heavily skewed toward one map. Inspect the before/after town and class-presence statistics; the score is a heuristic and does not certify pseudo-label correctness.
+6. **Create leakage-aware splits.** Use the collection-session grouping strategy and an explicit random seed. For a stronger domain-shift experiment, reserve one or more entire towns for the test set.
 6. **Train/fine-tune a semantic model.** Record the exact checkpoint or YAML architecture, model scale, image size, optimizer and schedule, seed, deterministic setting, effective device, and all augmentation choices.
 7. **Select on validation only.** Use validation metrics for model selection and hyperparameter iteration. Keep the test set untouched until the final comparison.
 8. **Evaluate the final checkpoint.** Run the independent test split and retain the complete machine-readable report.
@@ -27,6 +28,8 @@ The application provides tooling for building the data pipeline and recording ex
 RoadForge assigns whole collection-session groups to a single split. It additionally links groups containing byte-identical image content (SHA-256) so exact duplicate frames cannot appear on opposite sides of a split.
 
 This is stronger than shuffling individual frames, which would allow highly correlated neighboring frames from one drive session to be distributed across train and test.
+
+When quality-aware reduction is enabled, the target subset is selected before the group-level split. Town quotas are equal by default, and each town's quota is also spread across its collection sessions; disabling town balancing uses source-proportional quotas. Small or indivisible session groups can make final train/validation/test proportions differ from requested ratios.
 
 The splitter uses a seeded, group-level assignment that attempts to approximate requested sample ratios. Since group sizes differ, exact ratios are not guaranteed. A town holdout assigns all groups that contain a selected town to test; session integrity can consequently move additional samples from those groups into test.
 

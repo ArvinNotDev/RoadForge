@@ -51,7 +51,7 @@ flowchart LR
 |---|---|
 | **Simulation data acquisition** | PySide6 collector for CARLA; dynamically enumerated installed maps, weather, ego vehicle, optional background traffic, RGB camera, capture cadence, and metadata |
 | **Teacher-based annotation** | One YOLOPv2 ONNX teacher for drivable area, lane lines, and COCO vehicle detections; GrabCut/box vehicle-mask extraction; four-class targets; preview and legacy reannotation |
-| **Dataset management** | Collection discovery, metadata filters, image/mask pairing, manifest-aware label selection, non-destructive dataset preparation |
+| **Dataset management** | Collection discovery, metadata filters, image/mask pairing, manifest-aware label selection, non-destructive preparation, optional quality-aware downsampling with town/session and rare-class coverage |
 | **Quality assurance** | Decode and dimension checks, class-ID validation, empty-mask warnings, duplicate filename detection, SHA-256 duplicate-frame detection, complete JSON audit report |
 | **Leakage-aware splitting** | Collection-session grouping, exact-duplicate group linking, seeded train/validation/test assignment, optional held-out-town evaluation |
 | **Model training** | YOLO26 semantic model scales (`n`, `s`, `m`, `l`, `x`), pretrained checkpoint fine-tuning, architecture-only initialization, pause/stop at checkpoint boundaries, resume support |
@@ -176,7 +176,8 @@ The adapter expects the six-output YOLOPv2 ONNX graph: detection heads/anchors a
 4. Validate the selected samples and review the report.
 5. Choose train/validation/test ratios and a split seed. The default is 80/10/10.
 6. Optionally reserve complete towns for the test split.
-7. Prepare a dataset copy under the RoadForge workspace.
+7. Optionally enable **quality-aware dataset reduction**, set a target sample count, and keep town/map balancing enabled to avoid over-representing one map or collection session.
+8. Prepare a dataset copy under the RoadForge workspace. Selection metrics and before/after town and class coverage are saved in `dataset_report.json` and `split_manifest.json`; raw collections are never modified.
 
 ### D. Train or fine-tune a model
 
@@ -234,6 +235,7 @@ RoadForge/
 │   │   ├── config.py              # Versioned experiment configuration
 │   │   ├── dataset.py             # Discovery, validation, dataset indexing
 │   │   ├── splits.py              # Group-aware dataset preparation
+│   │   ├── selection.py           # Quality-aware, town/session-stratified sample selection
 │   │   ├── metrics.py             # Segmentation metrics
 │   │   ├── registry.py            # Local model registry
 │   │   ├── runtime.py             # Train/eval/inference/export/deployment runtime

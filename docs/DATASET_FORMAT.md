@@ -95,6 +95,12 @@ prepared_dataset/
 
 The YAML declares `images/train`, `images/val`, optional `images/test`, `masks_dir: masks`, and the four class names: `background`, `ego_drivable_area`, `lane_lines`, and `vehicles`. The test directory and YAML entry are present when a non-empty test split is requested.
 
+### Optional quality-aware downsampling
+
+When requested, reduction is applied only to the validated sample list before splitting. RoadForge scores image sharpness (Laplacian variance), relative contrast, exposure/clipping, semantic foreground coverage, and support for less frequent foreground classes. Sharpness and contrast are ranked within each town to reduce cross-map lighting bias. The target is allocated across towns and collection sessions (equal quotas by default, or source-proportional quotas when balancing is disabled), then the highest-scoring samples are kept within each stratum. The downstream splitter still keeps collection sessions and byte-identical images on one side of a split. This is a reproducible screening heuristic, not a substitute for visual review or human verification of teacher pseudo-labels.
+
+`dataset_report.json` and `split_manifest.json` record whether reduction was applied, source and selected counts, target, town coverage before and after, class-presence counts, score weights, and selected per-sample scores. No source image or annotation is deleted or modified.
+
 `split_manifest.json` stores each prepared sample's exact image and mask paths, source paths, town, collection, session/group identifiers, weather, traffic metadata, route ID, and split assignment. Evaluation reads this manifest rather than trying to reconstruct the original filenames.
 
 ## Validation checks

@@ -47,6 +47,7 @@ The primary application is a PySide6 desktop interface. Its UI pages are backed 
 |---|---|
 | `core/dataset.py` | Collection discovery, metadata indexing, image/mask validation, hashes, and report export |
 | `core/splits.py` | Group-aware partitioning and non-destructive dataset preparation |
+| `core/selection.py` | Quality scoring and town/session-stratified subset selection |
 | `core/config.py` | Versioned training configuration, migration, and snapshots |
 | `core/workers.py` | Background Qt workers for scanning, training, inference, and evaluation |
 | `core/runtime.py` | Checkpoint verification, training support, prediction, evaluation, export, parity checks, benchmarks, and deployment packaging |

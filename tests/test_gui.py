@@ -23,6 +23,10 @@ def test_main_window_loads_all_sections_and_controls(tmp_path, monkeypatch):
     assert all(edit.isReadOnly() for edit in window.class_names)
     assert [edit.text() for edit in window.class_names] == ["background", "ego_drivable_area", "lane_lines", "vehicles"]
     assert hasattr(window, "traffic_filter")
+    assert hasattr(window, "downsample_enabled")
+    assert window.downsample_count.value() == 7000
+    assert not window.downsample_enabled.isChecked()
+    assert window.balance_towns.isChecked()
     assert window.model_registry_table.columnCount() == 7
     window.model_size.setCurrentText("n")
     assert window.model_name.text() == "YOLO26n-sem · semantic"
