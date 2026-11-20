@@ -11,7 +11,7 @@ from roadforge.core.metrics import confusion_matrix, metrics_from_confusion
 from roadforge.core.runtime import _DEPLOYMENT_INFERENCE_SCRIPT, _dataset_manifest_file, _semantic_array_to_mask, evaluate_dataset, run_folder_inference
 from roadforge.core.registry import list_models, register_model, remove_model
 from roadforge.core.splits import prepare_dataset, split_samples
-from roadforge.core.selection import select_quality_balanced_samples
+from roadforge.core.selection import select_quality_balanced_samples, _allocate_quotas
 
 
 def make_sample(tmp_path: Path, group: str, index: int, mask_values=None) -> Sample:
@@ -149,6 +149,19 @@ def test_quality_selection_is_deterministic_and_balances_towns_and_sessions(tmp_
     for town in ("Town01", "Town02"):
         selected_sessions = {sample.group_id for sample in first if sample.town == town}
         assert len(selected_sessions) == 3
+
+
+def test_session_quota_ties_are_seeded_and_not_alphabetically_biased():
+    import random
+
+    capacities = {"session-a": 10, "session-b": 10, "session-c": 10, "session-d": 10}
+    first = _allocate_quotas(2, capacities, equal=True, rng=random.Random(7))
+    repeated = _allocate_quotas(2, capacities, equal=True, rng=random.Random(7))
+    other_seed = _allocate_quotas(2, capacities, equal=True, rng=random.Random(19))
+    assert first == repeated
+    assert sum(first.values()) == 2
+    assert sum(1 for value in first.values() if value) == 2
+    assert first != other_seed
 
 
 def test_quality_selection_refuses_to_drop_a_town_or_accept_invalid_target(tmp_path):

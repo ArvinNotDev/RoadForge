@@ -178,7 +178,7 @@ def prepare_dataset(
         raise ValueError("No valid image-mask pairs are available.")
 
     selected_samples = report.valid
-    selection_scores: dict[str, float] = {}
+    selection_scores: dict[int, float] = {}
     if max_samples is None:
         selection_report = {
             "enabled": False, "applied": False,
@@ -241,8 +241,8 @@ def prepare_dataset(
                     "weather": sample.weather,
                     "traffic": sample.traffic,
                 }
-                if sample.image in selection_scores:
-                    row["selection_quality_score"] = round(selection_scores[sample.image], 6)
+                if id(sample) in selection_scores:
+                    row["selection_quality_score"] = round(selection_scores[id(sample)], 6)
                 split_rows[part].append(row)
 
                 with Image.open(mask_source) as image_mask:

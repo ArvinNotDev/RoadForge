@@ -75,7 +75,7 @@ def _mask_metrics(path: str) -> tuple[float, set[int]]:
     return coverage, present
 
 
-def _allocate_quotas(total: int, capacities: dict[str, int], equal: bool) -> dict[str, int]:
+def _allocate_quotas(total: int, capacities: dict[str, int], equal: bool, rng: random.Random | None = None) -> dict[str, int]:
     """Allocate an exact count without exceeding any town/session capacity."""
     keys = sorted(capacities)
     if total < 0 or total > sum(capacities.values()):
@@ -101,9 +101,13 @@ def _allocate_quotas(total: int, capacities: dict[str, int], equal: bool) -> dic
         total -= allocated
         if not total:
             break
+        tie_order = list(active)
+        if rng is not None:
+            rng.shuffle(tie_order)
+        tie_rank = {key: index for index, key in enumerate(tie_order)}
         remainder_order = sorted(
             (key for key in active if quotas[key] < capacities[key]),
-            key=lambda key: (-(exact[key] - math.floor(exact[key])), key),
+            key=lambda key: (-(exact[key] - math.floor(exact[key])), tie_rank[key]),
         )
         if not remainder_order:
             break
@@ -123,7 +127,7 @@ def select_quality_balanced_samples(
     seed: int = 42,
     balance_towns: bool = True,
     progress=None,
-) -> tuple[list[Sample], dict, dict[str, float]]:
+) -> tuple[list[Sample], dict, dict[int, float]]:
     """Select a quality-ranked subset with town/session coverage and rare-class support.
 
     Image metrics are ranked within each town to avoid systematically favoring maps with
@@ -201,10 +205,11 @@ def select_quality_balanced_samples(
             )
             scores[index] = float(max(0.0, min(1.0, score)))
 
-    town_quotas = _allocate_quotas(
-        target_count, {town: len(rows) for town, rows in by_town.items()}, bool(balance_towns)
-    )
     rng = random.Random(seed)
+    town_quotas = _allocate_quotas(
+        target_count, {town: len(rows) for town, rows in by_town.items()},
+        bool(balance_towns), rng=rng,
+    )
     selected_indices: set[int] = set()
     for town in towns:
         sessions: dict[str, list[tuple[int, Sample]]] = defaultdict(list)
@@ -214,7 +219,7 @@ def select_quality_balanced_samples(
         session_quotas = _allocate_quotas(
             town_quotas[town],
             {session: len(rows) for session, rows in sessions.items()},
-            bool(balance_towns),
+            bool(balance_towns), rng=rng,
         )
         for session in sorted(sessions):
             candidates = list(sessions[session])
@@ -228,7 +233,7 @@ def select_quality_balanced_samples(
             f"Quality selection produced {len(selected):,} samples instead of {target_count:,}."
         )
     selected_scores = {
-        sample.image: scores[index]
+        id(sample): scores[index]
         for index, sample in enumerate(samples) if index in selected_indices
     }
     town_after = Counter(str(sample.town or "Unknown") for sample in selected)
