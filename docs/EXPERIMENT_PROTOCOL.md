@@ -18,10 +18,10 @@ The application provides tooling for building the data pipeline and recording ex
 4. **Audit the dataset.** Review missing/corrupt pairs, dimensions, allowed class IDs, empty masks, duplicate names, duplicate image hashes, and per-class pixel distributions. Export the full JSON report.
 5. **Optionally reduce the prepared sample count.** Use RoadForge's quality-aware selector when training cost requires a smaller subset. It ranks sharpness, contrast, exposure, mask coverage, and rare-class support within each town, then allocates samples across towns and collection sessions. Keep town balancing enabled when the original collection is heavily skewed toward one map. Inspect the before/after town and class-presence statistics; the score is a heuristic and does not certify pseudo-label correctness.
 6. **Create leakage-aware splits.** Use the collection-session grouping strategy and an explicit random seed. For a stronger domain-shift experiment, reserve one or more entire towns for the test set.
-6. **Train/fine-tune a semantic model.** Record the exact checkpoint or YAML architecture, model scale, image size, optimizer and schedule, seed, deterministic setting, effective device, and all augmentation choices.
-7. **Select on validation only.** Use validation metrics for model selection and hyperparameter iteration. Keep the test set untouched until the final comparison.
-8. **Evaluate the final checkpoint.** Run the independent test split and retain the complete machine-readable report.
-9. **Export and verify deployment artifacts.** Validate ONNX graph integrity, inspect input/output metadata, run a smoke test, measure PyTorch/ONNX prediction parity, and benchmark on the target hardware.
+7. **Train/fine-tune a semantic model.** Record the exact checkpoint or YAML architecture, model scale, image size, optimizer and schedule, seed, deterministic setting, effective device, and all augmentation choices.
+8. **Select on validation only.** Use validation metrics for model selection and hyperparameter iteration. Keep the test set untouched until the final comparison.
+9. **Evaluate the final checkpoint.** Run the independent test split and retain the complete machine-readable report.
+10. **Export and verify deployment artifacts.** Validate ONNX graph integrity, inspect input/output metadata, run a smoke test, measure PyTorch/ONNX prediction parity, and benchmark on the target hardware.
 
 ## Split design and leakage control
 
