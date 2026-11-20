@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .config import DEFAULT_CLASSES
 from .dataset import Sample
-from .selection import select_quality_balanced_samples
+from .selection import _allocate_quotas, select_quality_balanced_samples, select_stratified_random_samples
 
 
 @dataclass
@@ -177,21 +177,121 @@ def prepare_dataset(
     if not report.valid:
         raise ValueError("No valid image-mask pairs are available.")
 
-    selected_samples = report.valid
+    # Assign every original sample to a leakage-aware split before downsampling.
+    # This prevents quality ranking from making validation/test artificially easy.
+    source_split = split_samples(report.valid, ratios, seed, holdout_towns)
     selection_scores: dict[int, float] = {}
     if max_samples is None:
         selection_report = {
             "enabled": False, "applied": False,
-            "method": "quality_stratified_town_session_v1",
+            "method": "split_first_train_quality_eval_random_v2",
             "available_samples": len(report.valid),
             "selected_samples": len(report.valid),
         }
+        split = source_split
+    elif isinstance(max_samples, bool) or not isinstance(max_samples, int) or max_samples < 1:
+        raise ValueError("max_samples must be a positive integer when downsampling is enabled.")
+    elif max_samples >= len(report.valid):
+        selection_report = {
+            "enabled": True, "applied": False,
+            "method": "split_first_train_quality_eval_random_v2",
+            "target_samples": max_samples,
+            "available_samples": len(report.valid),
+            "selected_samples": len(report.valid),
+            "reason": "The requested limit is not smaller than the valid dataset.",
+        }
+        split = source_split
     else:
-        selected_samples, selection_report, selection_scores = select_quality_balanced_samples(
-            report.valid, max_samples, seed=seed, balance_towns=balance_towns, progress=progress
-        )
+        available_by_split = {
+            "train": len(source_split.train),
+            "val": len(source_split.val),
+            "test": len(source_split.test),
+        }
+        active_parts = [part for part, count in available_by_split.items() if count > 0]
+        if max_samples < len(active_parts):
+            raise ValueError(
+                f"The target ({max_samples:,}) is too small to retain every requested "
+                f"non-empty split ({', '.join(active_parts)}). Increase the target to at least {len(active_parts)}."
+            )
 
-    split = split_samples(selected_samples, ratios, seed, holdout_towns)
+        # Retain the actual source split proportions after indivisible session grouping.
+        split_budgets = _allocate_quotas(
+            max_samples,
+            {part: available_by_split[part] for part in active_parts},
+            equal=False,
+            rng=random.Random(seed),
+        )
+        selected_by_split = {"train": [], "val": [], "test": []}
+        split_selection_reports = {}
+        quality_scores_by_split = {}
+        seed_offsets = {"train": 0, "val": 1, "test": 2}
+
+        for part, source_values in (
+            ("train", source_split.train),
+            ("val", source_split.val),
+            ("test", source_split.test),
+        ):
+            budget = split_budgets.get(part, 0)
+            if not budget:
+                split_selection_reports[part] = {
+                    "enabled": False,
+                    "applied": False,
+                    "available_samples": len(source_values),
+                    "selected_samples": 0,
+                }
+                continue
+            part_seed = seed + seed_offsets[part]
+            if part == "train":
+                chosen, part_report, part_scores = select_quality_balanced_samples(
+                    source_values, budget, seed=part_seed,
+                    balance_towns=balance_towns, progress=progress,
+                )
+                quality_scores_by_split[part] = part_scores
+            else:
+                chosen, part_report = select_stratified_random_samples(
+                    source_values, budget, seed=part_seed, balance_towns=balance_towns,
+                )
+            selected_by_split[part] = chosen
+            split_selection_reports[part] = part_report
+
+        split = SplitResult(
+            train=selected_by_split["train"],
+            val=selected_by_split["val"],
+            test=selected_by_split["test"],
+            group_assignment=source_split.group_assignment,
+            counts=source_split.counts,
+        )
+        selection_scores = quality_scores_by_split.get("train", {})
+        selected_samples = split.train + split.val + split.test
+        source_town_counts = Counter(str(sample.town or "Unknown") for sample in report.valid)
+        selected_town_counts = Counter(str(sample.town or "Unknown") for sample in selected_samples)
+        selection_report = {
+            "enabled": True,
+            "applied": True,
+            "method": "split_first_train_quality_eval_random_v2",
+            "target_samples": max_samples,
+            "available_samples": len(report.valid),
+            "selected_samples": len(selected_samples),
+            "removed_from_prepared_copy": len(report.valid) - len(selected_samples),
+            "balance_towns": bool(balance_towns),
+            "town_counts_before": dict(sorted(source_town_counts.items())),
+            "town_counts_after": dict(sorted(selected_town_counts.items())),
+            "split_allocations": {
+                part: {
+                    "available": available_by_split[part],
+                    "selected": len(selected_by_split[part]),
+                }
+                for part in ("train", "val", "test")
+            },
+            "split_selection": split_selection_reports,
+            "notes": [
+                "All original samples are assigned to train/validation/test before sample reduction.",
+                "Only training samples are ranked by image and mask quality.",
+                "Validation and test subsets are selected randomly within town/session strata to avoid quality-based evaluation bias.",
+                "Collection sessions and exact duplicate-image groups never move between splits.",
+                "Quality scores are heuristic screening signals, not human verification of pseudo-label correctness.",
+            ],
+        }
     target = Path(output_root).expanduser().resolve()
     if target.exists() and not target.is_dir():
         raise NotADirectoryError(f"Prepared dataset destination is not a directory: {target}")

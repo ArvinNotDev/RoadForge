@@ -121,6 +121,97 @@ def _allocate_quotas(total: int, capacities: dict[str, int], equal: bool, rng: r
     return quotas
 
 
+
+def select_stratified_random_samples(
+    samples: list[Sample],
+    target_count: int,
+    seed: int = 42,
+    balance_towns: bool = True,
+) -> tuple[list[Sample], dict]:
+    """Choose a reproducible, town/session-stratified random subset for evaluation.
+
+    Unlike the training selector, this intentionally does not inspect image quality or
+    semantic masks when deciding which examples to retain. This keeps validation and test
+    representative instead of preferentially retaining easy, high-scoring frames.
+    """
+    if isinstance(target_count, bool) or not isinstance(target_count, int) or target_count < 1:
+        raise ValueError("The target dataset size must be a positive integer.")
+    if not samples:
+        raise ValueError("No samples are available for representative selection.")
+
+    town_counts = Counter(str(sample.town or "Unknown") for sample in samples)
+    towns = sorted(town_counts)
+    if target_count >= len(samples):
+        return list(samples), {
+            "enabled": True,
+            "applied": False,
+            "method": "random_stratified_town_session_v1",
+            "target_samples": target_count,
+            "available_samples": len(samples),
+            "selected_samples": len(samples),
+            "balance_towns": bool(balance_towns),
+            "town_counts_before": dict(sorted(town_counts.items())),
+            "town_counts_after": dict(sorted(town_counts.items())),
+        }
+
+    if target_count < len(towns):
+        raise ValueError(
+            f"The evaluation subset target ({target_count:,}) is smaller than the number "
+            f"of selected towns ({len(towns)}). Increase the target to at least {len(towns):,} "
+            "or include fewer towns in this split."
+        )
+
+    rng = random.Random(seed)
+    town_quotas = _allocate_quotas(
+        target_count,
+        {town: town_counts[town] for town in towns},
+        bool(balance_towns),
+        rng=rng,
+    )
+    selected_indices: set[int] = set()
+    for town in towns:
+        sessions: dict[str, list[tuple[int, Sample]]] = defaultdict(list)
+        for index, sample in enumerate(samples):
+            if str(sample.town or "Unknown") != town:
+                continue
+            session = str(sample.group_id or sample.session_id or sample.collection)
+            sessions[session].append((index, sample))
+
+        session_quotas = _allocate_quotas(
+            town_quotas[town],
+            {session: len(values) for session, values in sessions.items()},
+            bool(balance_towns),
+            rng=rng,
+        )
+        for session in sorted(sessions):
+            candidates = list(sessions[session])
+            rng.shuffle(candidates)
+            selected_indices.update(index for index, _ in candidates[:session_quotas[session]])
+
+    selected = [sample for index, sample in enumerate(samples) if index in selected_indices]
+    if len(selected) != target_count:
+        raise RuntimeError(
+            f"Representative selection produced {len(selected):,} samples instead of {target_count:,}."
+        )
+
+    town_after = Counter(str(sample.town or "Unknown") for sample in selected)
+    return selected, {
+        "enabled": True,
+        "applied": True,
+        "method": "random_stratified_town_session_v1",
+        "target_samples": target_count,
+        "available_samples": len(samples),
+        "selected_samples": len(selected),
+        "balance_towns": bool(balance_towns),
+        "town_counts_before": dict(sorted(town_counts.items())),
+        "town_counts_after": dict(sorted(town_after.items())),
+        "notes": [
+            "Selection is random within town and collection-session strata.",
+            "No image-quality score is used to select validation or test samples.",
+            "The source split is assigned before this reduction and is never changed.",
+        ],
+    }
+
 def select_quality_balanced_samples(
     samples: list[Sample],
     target_count: int,

@@ -11,7 +11,7 @@ from roadforge.core.metrics import confusion_matrix, metrics_from_confusion
 from roadforge.core.runtime import _DEPLOYMENT_INFERENCE_SCRIPT, _dataset_manifest_file, _semantic_array_to_mask, evaluate_dataset, run_folder_inference
 from roadforge.core.registry import list_models, register_model, remove_model
 from roadforge.core.splits import prepare_dataset, split_samples
-from roadforge.core.selection import select_quality_balanced_samples, _allocate_quotas
+from roadforge.core.selection import select_quality_balanced_samples, select_stratified_random_samples, _allocate_quotas
 
 
 def make_sample(tmp_path: Path, group: str, index: int, mask_values=None) -> Sample:
@@ -151,6 +151,28 @@ def test_quality_selection_is_deterministic_and_balances_towns_and_sessions(tmp_
         assert len(selected_sessions) == 3
 
 
+def test_evaluation_selector_is_random_stratified_and_reproducible(tmp_path):
+    samples = []
+    for town in ("Town01", "Town02"):
+        for session in range(4):
+            for frame in range(3):
+                index = len(samples) + 1
+                sample = make_sample(tmp_path / "source", f"{town}-session-{session}", index)
+                sample.town = town
+                sample.group_id = f"{town}-session-{session}"
+                sample.session_id = sample.group_id
+                samples.append(sample)
+
+    first, report = select_stratified_random_samples(samples, 8, seed=71, balance_towns=True)
+    second, repeated_report = select_stratified_random_samples(samples, 8, seed=71, balance_towns=True)
+
+    assert [sample.image for sample in first] == [sample.image for sample in second]
+    assert report == repeated_report
+    assert report["town_counts_after"] == {"Town01": 4, "Town02": 4}
+    assert report["method"] == "random_stratified_town_session_v1"
+    assert all("selection_quality_score" not in vars(sample) for sample in first)
+
+
 def test_session_quota_ties_are_seeded_and_not_alphabetically_biased():
     import random
 
@@ -202,6 +224,12 @@ def test_prepare_dataset_quality_reduction_is_exact_and_non_destructive(tmp_path
     assert report["samples"] == 4
     assert report["source_samples"] == 8
     assert manifest["selection"]["selected_samples"] == 4
+    assert manifest["selection"]["method"] == "split_first_train_quality_eval_random_v2"
+    assert manifest["selection"]["split_allocations"]["train"]["selected"] == 2
+    assert manifest["selection"]["split_allocations"]["val"]["selected"] == 1
+    assert manifest["selection"]["split_allocations"]["test"]["selected"] == 1
+    assert all("selection_quality_score" in row for row in manifest["samples"]["train"])
+    assert all("selection_quality_score" not in row for part in ("val", "test") for row in manifest["samples"][part])
     assert sum(len(rows) for rows in manifest["samples"].values()) == 4
     assert all(Path(path).read_bytes() == content for path, content in source_bytes.items())
     assert len(list((Path(result["path"]) / "images").glob("*/*"))) == 4
