@@ -1320,11 +1320,11 @@ class MainWindow(QMainWindow):
     def _register_model_artifact(self, model_path: str | Path, details: dict | None = None):
         entry = register_model(self._model_library_workspace(), model_path, details)
         self._refresh_model_registry()
-        self._append_log(f"Registered semantic model: {entry['path']}")
+        self._append_log(f"Registered {entry.get('task', 'model')} artifact: {entry['path']}")
         return entry
 
     def register_model_file(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Register semantic model", str(PROJECT_ROOT), "Models (*.pt *.onnx)")
+        path, _ = QFileDialog.getOpenFileName(self, "Register model artifact", str(PROJECT_ROOT), "Models (*.pt *.onnx)")
         if not path:
             return
         try:
@@ -1333,6 +1333,7 @@ class MainWindow(QMainWindow):
             self._show_error("Could not register model", str(exc))
 
     def use_registered_model(self):
+        row = self.model_registry_table.currentRow()
         path = self._selected_registered_model()
         if not path:
             QMessageBox.information(self, "Select a model", "Select an entry in the model library first.")
@@ -1340,7 +1341,18 @@ class MainWindow(QMainWindow):
         if not Path(path).is_file():
             QMessageBox.warning(self, "Model file missing", f"The registered file is unavailable:\n{path}")
             return
+        task_item = self.model_registry_table.item(row, 2) if row >= 0 else None
+        registered_task = task_item.text().strip().lower() if task_item else "semantic"
         self.active_model = path
+        self.latest_onnx_task = registered_task
+        if registered_task == "classification":
+            if Path(path).suffix.lower() == ".onnx":
+                self.onnx_path.setText(path)
+            else:
+                self.onnx_source.setText(path)
+            self.onnx_status.setText("Loaded registered AVIS classification model. Semantic inference and deployment tools are not applicable to this multi-head classifier.")
+            self.stack.setCurrentIndex(7)
+            return
         self.test_model.setText(path)
         self.eval_model.setText(path)
         if Path(path).suffix.lower() == ".onnx":
