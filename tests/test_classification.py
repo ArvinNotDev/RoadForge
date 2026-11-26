@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import numpy as np
+
 import pytest
 from PIL import Image
 
@@ -199,6 +201,6 @@ def test_resnet18_multitask_checkpoint_exports_to_onnx(tmp_path):
         "logits_lane",
     ]
     values = session.run(
-        None, {"images": __import__("numpy").zeros((1, 3, 224, 224), dtype="float32")}
+        None, {"images": np.zeros((1, 3, 224, 224), dtype=np.float32)}
     )
     assert [tuple(item.shape) for item in values] == [(1, 2), (1, 2)]
