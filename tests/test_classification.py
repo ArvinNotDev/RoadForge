@@ -136,3 +136,69 @@ def test_supported_backbones_produce_one_output_per_task(backbone):
     assert len(outputs) == 2
     assert tuple(outputs[0].shape) == (2, 2)
     assert tuple(outputs[1].shape) == (2, 3)
+
+
+
+def test_resnet18_multitask_checkpoint_exports_to_onnx(tmp_path):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("torchvision")
+    pytest.importorskip("onnx")
+    onnxruntime = pytest.importorskip("onnxruntime")
+
+    from roadforge.classification_training import build_multitask_classifier
+    from roadforge.core.runtime import export_onnx
+
+    tasks = [
+        {"key": "obstacle_ahead", "name": "Obstacle ahead", "classes": ["no", "yes"]},
+        {"key": "lane", "name": "Lane", "classes": ["right", "left"]},
+    ]
+    model = build_multitask_classifier("resnet18", tasks, pretrained=False)
+    checkpoint = tmp_path / "avis_resnet18_best.pt"
+    torch.save(
+        {
+            "format_version": 1,
+            "backbone": "resnet18",
+            "tasks": tasks,
+            "input_size": 224,
+            "mean": (0.485, 0.456, 0.406),
+            "std": (0.229, 0.224, 0.225),
+            "state_dict": model.state_dict(),
+        },
+        checkpoint,
+    )
+
+    result = export_onnx(
+        str(checkpoint),
+        imgsz=512,  # The classification checkpoint's saved 224px input must take precedence.
+        opset=17,
+        dynamic=True,
+        output_dir=tmp_path / "exports",
+    )
+
+    assert result["task"] == "classification"
+    assert result["backbone"] == "resnet18"
+    assert result["input_size"] == 224
+    assert result["dynamic_batch"] is True
+    assert result["dynamic_spatial"] is False
+    assert result["onnx_checker"] == "passed"
+    assert result["smoke_test"] == "passed"
+    assert len(result["pytorch_onnx_parity"]) == 2
+    assert all(item["allclose"] for item in result["pytorch_onnx_parity"])
+    assert [item["key"] for item in result["task_outputs"]] == ["obstacle_ahead", "lane"]
+    assert [item["classes"] for item in result["task_outputs"]] == [["no", "yes"], ["right", "left"]]
+
+    session = onnxruntime.InferenceSession(
+        result["path"], providers=["CPUExecutionProvider"]
+    )
+    metadata = session.get_modelmeta().custom_metadata_map
+    assert metadata["task"] == "classification"
+    assert metadata["backbone"] == "resnet18"
+    assert metadata["input_size"] == "224"
+    assert [output.name for output in session.get_outputs()] == [
+        "logits_obstacle_ahead",
+        "logits_lane",
+    ]
+    values = session.run(
+        None, {"images": __import__("numpy").zeros((1, 3, 224, 224), dtype="float32")}
+    )
+    assert [tuple(item.shape) for item in values] == [(1, 2), (1, 2)]
