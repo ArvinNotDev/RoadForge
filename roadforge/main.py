@@ -572,7 +572,7 @@ class MainWindow(QMainWindow):
         top.addWidget(self.onnx_source, 1); top.addWidget(button("Checkpoint…", lambda: self._choose_file(self.onnx_source, "PyTorch checkpoint (*.pt)")))
         self.onnx_imgsz = QSpinBox(); self.onnx_imgsz.setRange(128, 2048); self.onnx_imgsz.setValue(512); self.onnx_imgsz.setPrefix("Image size "); top.addWidget(self.onnx_imgsz)
         self.onnx_opset = QSpinBox(); self.onnx_opset.setRange(12, 21); self.onnx_opset.setValue(17); self.onnx_opset.setPrefix("Opset "); top.addWidget(self.onnx_opset)
-        self.onnx_dynamic = QCheckBox("Dynamic batch"); self.onnx_dynamic.setToolTip("For AVIS classifiers, only the batch dimension is dynamic; the trained spatial input size remains fixed."); top.addWidget(self.onnx_dynamic)
+        self.onnx_dynamic = QCheckBox("Dynamic shapes"); self.onnx_dynamic.setToolTip("Semantic models use the Ultralytics dynamic-shape option. AVIS classifiers keep the trained spatial size fixed and make only the batch dimension dynamic."); top.addWidget(self.onnx_dynamic)
         self.onnx_simplify = QCheckBox("Simplify graph"); top.addWidget(self.onnx_simplify)
         top.addWidget(button("Export + validate", self.start_onnx_export, primary=True))
         layout.addLayout(top)
