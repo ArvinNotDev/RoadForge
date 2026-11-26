@@ -134,13 +134,33 @@ def discover_collections(dataset_roots: Iterable[str | Path]) -> list[Collection
             except (OSError, json.JSONDecodeError):
                 manifest = {}
             collection_config = manifest.get("config", {}) if isinstance(manifest.get("config", {}), dict) else {}
-            try:
-                annotations = json.loads((collection / "annotation_manifest.json").read_text(encoding="utf-8-sig"))
-                annotation_entries = annotations.get("images", {})
-                if not isinstance(annotation_entries, dict):
-                    annotation_entries = {}
-            except (OSError, json.JSONDecodeError):
-                annotation_entries = {}
+            # Teacher annotations may have been generated with either the AVIS
+            # capture root or its images/ folder selected as the source. In the
+            # latter case, Collector stores annotation_manifest.json and labels
+            # inside images/. Read both layouts so the Dataset Manager can pair
+            # the same frames without forcing users to annotate them again.
+            annotation_entries_by_root: dict[Path, dict] = {}
+            annotation_roots = [collection]
+            if not is_carla and generic_image_dir != collection:
+                annotation_roots.append(generic_image_dir)
+            for annotation_root in annotation_roots:
+                try:
+                    annotations = json.loads(
+                        (annotation_root / "annotation_manifest.json").read_text(encoding="utf-8-sig")
+                    )
+                    entries = annotations.get("images", {})
+                    if isinstance(entries, dict):
+                        annotation_entries_by_root[annotation_root] = entries
+                    else:
+                        annotation_entries_by_root[annotation_root] = {}
+                except (OSError, json.JSONDecodeError):
+                    annotation_entries_by_root[annotation_root] = {}
+            annotation_entries = dict(annotation_entries_by_root.get(collection, {}))
+            if not is_carla and generic_image_dir != collection:
+                # Keep the parent-root entries authoritative; the nested layout
+                # normally uses bare filenames as keys (e.g. frame.jpg).
+                for key, value in annotation_entries_by_root.get(generic_image_dir, {}).items():
+                    annotation_entries.setdefault(key, value)
 
             metadata_by_path: dict[str, dict] = {}
             metadata_by_filename: dict[str, dict] = {}
@@ -204,26 +224,56 @@ def discover_collections(dataset_roots: Iterable[str | Path]) -> list[Collection
                 ):
                     rel = image.relative_to(collection).as_posix()
                     seen_rel.add(rel)
-                    entry = annotation_entries.get(rel, {})
+                    entry = annotation_entries_by_root.get(collection, {}).get(rel, {})
+                    annotation_root = collection
+                    manifest_key = rel
+                    if (
+                        not entry
+                        and not is_carla
+                        and generic_image_dir != collection
+                    ):
+                        nested_entry = annotation_entries_by_root.get(generic_image_dir, {}).get(image.name, {})
+                        if nested_entry:
+                            entry = nested_entry
+                            annotation_root = generic_image_dir
+                            manifest_key = image.name
+
                     mask = None
                     status = str(entry.get("status", "missing"))
                     combined = entry.get("combined_mask") if status == "success" else None
-                    mask_path = _safe_manifest_path(collection, str(combined)) if combined else None
+                    mask_path = _safe_manifest_path(annotation_root, str(combined)) if combined else None
                     if mask_path and mask_path.is_file():
                         mask = str(mask_path)
-                    elif not entry:
-                        candidate_v4 = collection / "labels_yolopv2" / scope_name / "combined_4class" / image.name
-                        candidate_v3 = collection / "labels_yolopv2" / scope_name / "combined_3class" / image.name
-                        if candidate_v4.is_file():
-                            mask = str(candidate_v4)
-                            status = "discovered_combined_4class"
-                        elif candidate_v3.is_file():
-                            mask = str(candidate_v3)
-                            status = "discovered_combined_3class"
+                    elif combined and annotation_root != collection:
+                        # Accommodate manifests whose mask path was written
+                        # relative to the capture root rather than images/.
+                        alternate_mask_path = _safe_manifest_path(collection, str(combined))
+                        if alternate_mask_path and alternate_mask_path.is_file():
+                            mask = str(alternate_mask_path)
+                    if mask is None and not entry:
+                        candidate_roots = [collection]
+                        if not is_carla and generic_image_dir != collection:
+                            candidate_roots.append(generic_image_dir)
+                        for candidate_root in candidate_roots:
+                            candidate_v4 = candidate_root / "labels_yolopv2" / scope_name / "combined_4class" / image.name
+                            candidate_v3 = candidate_root / "labels_yolopv2" / scope_name / "combined_3class" / image.name
+                            if candidate_v4.is_file():
+                                mask = str(candidate_v4)
+                                status = "discovered_combined_4class"
+                                break
+                            if candidate_v3.is_file():
+                                mask = str(candidate_v3)
+                                status = "discovered_combined_3class"
+                                break
 
                     metadata = dict(metadata_by_path.get(rel, metadata_by_filename.get(image.name, {})))
                     if entry:
-                        metadata["_annotation_original_image"] = entry.get("original_image")
+                        declared_image = str(entry.get("original_image") or "").replace("\\", "/")
+                        if manifest_key != rel and declared_image == manifest_key:
+                            # This entry was keyed relative to images/; normalize
+                            # it to the collection root for pair-integrity checks.
+                            declared_image = rel
+                        metadata["_annotation_original_image"] = declared_image or rel
                         metadata["_annotation_class_map"] = entry.get("class_map")
                         metadata["_annotation_num_classes"] = entry.get("num_classes")
                         entry_class_map = entry.get("class_map")

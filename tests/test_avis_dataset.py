@@ -244,3 +244,94 @@ def test_avis_postprocessed_vehicle_to_background_mask_is_valid(tmp_path):
     assert len(report.valid) == 1
     assert not [issue for issue in report.issues if issue.severity == "error"]
 
+def test_avis_collector_annotations_inside_images_subfolder_are_discovered_from_capture_root(tmp_path):
+    capture_root = tmp_path / "AVIS_RoadForge_Captures"
+    _write_avis_capture_set(capture_root, count=1)
+    image_rel = "images/avis_0000.jpg"
+
+    # This layout is produced when the Collector's Teacher source is selected
+    # as <capture-root>/images instead of the capture root itself.
+    annotation_root = capture_root / "images"
+    mask_path = annotation_root / "labels_yolopv2" / "AVIS" / "combined_4class_no_vehicles" / "avis_0000.png"
+    mask_path.parent.mkdir(parents=True)
+    mask = np.tile(np.array([[0, 1, 2, 0]], dtype=np.uint8), (12, 4))
+    Image.fromarray(mask, mode="L").save(mask_path)
+
+    original_mask_path = annotation_root / "labels_yolopv2" / "AVIS" / "combined_4class" / "avis_0000.png"
+    original_mask_path.parent.mkdir(parents=True)
+    original_mask = np.tile(np.array([[0, 1, 2, 3]], dtype=np.uint8), (12, 4))
+    Image.fromarray(original_mask, mode="L").save(original_mask_path)
+
+    annotation = {
+        "format": "yolopv2-annotations-v1",
+        "images": {
+            "avis_0000.jpg": {
+                "status": "success",
+                "original_image": "avis_0000.jpg",
+                "combined_mask": "labels_yolopv2/AVIS/combined_4class_no_vehicles/avis_0000.png",
+                "original_combined_mask": "labels_yolopv2/AVIS/combined_4class/avis_0000.png",
+                "postprocessing": {
+                    "operation": "map_class_to_background",
+                    "source_class_id": 3,
+                    "target_class_id": 0,
+                },
+                "class_map": {
+                    "0": "background",
+                    "1": "ego_drivable_area",
+                    "2": "lane_lines",
+                    "3": "vehicles",
+                },
+                "num_classes": 4,
+            }
+        },
+    }
+    (annotation_root / "annotation_manifest.json").write_text(
+        json.dumps(annotation, indent=2),
+        encoding="utf-8",
+    )
+
+    collections = discover_collections([capture_root])
+    assert len(collections) == 1
+    sample = collections[0].samples[0]
+    assert sample.image.endswith(image_rel)
+    assert sample.mask == str(mask_path)
+    assert sample.metadata["_annotation_original_image"] == image_rel
+
+    report = validate_samples([sample])
+    assert len(report.valid) == 1
+    assert not [issue for issue in report.issues if issue.severity == "error"]
+
+
+def test_avis_collector_annotations_inside_images_subfolder_are_discovered_when_selected_directly(tmp_path):
+    capture_root = tmp_path / "AVIS_RoadForge_Captures"
+    _write_avis_capture_set(capture_root, count=1)
+    image_root = capture_root / "images"
+    mask_path = image_root / "labels_yolopv2" / "AVIS" / "combined_4class" / "avis_0000.png"
+    mask_path.parent.mkdir(parents=True)
+    mask = np.tile(np.array([[0, 1, 2, 3]], dtype=np.uint8), (12, 4))
+    Image.fromarray(mask, mode="L").save(mask_path)
+    annotation = {
+        "images": {
+            "avis_0000.jpg": {
+                "status": "success",
+                "original_image": "avis_0000.jpg",
+                "combined_mask": "labels_yolopv2/AVIS/combined_4class/avis_0000.png",
+                "class_map": {
+                    "0": "background",
+                    "1": "ego_drivable_area",
+                    "2": "lane_lines",
+                    "3": "vehicles",
+                },
+                "num_classes": 4,
+            }
+        }
+    }
+    (image_root / "annotation_manifest.json").write_text(json.dumps(annotation), encoding="utf-8")
+
+    collections = discover_collections([image_root])
+    sample = collections[0].samples[0]
+    assert sample.mask == str(mask_path)
+    assert sample.metadata["_annotation_original_image"] == "avis_0000.jpg"
+    report = validate_samples([sample])
+    assert len(report.valid) == 1
+
