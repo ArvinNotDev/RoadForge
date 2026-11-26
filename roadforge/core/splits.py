@@ -20,6 +20,8 @@ class SplitResult:
     test: list[Sample]
     group_assignment: dict[str, str]
     counts: dict[str, int]
+    strategy: str = "collection_session"
+    warning: str | None = None
 
 
 def _validate_ratios(ratios: dict[str, float]) -> tuple[list[str], float]:
@@ -38,12 +40,54 @@ def split_samples(samples: list[Sample], ratios: dict[str, float], seed: int = 4
     if not samples:
         raise ValueError("No samples were supplied for splitting.")
 
-    groups: dict[str, list[Sample]] = defaultdict(list)
+    session_keys = {
+        id(sample): str(sample.group_id or sample.session_id or sample.collection)
+        for sample in samples
+    }
+    session_groups: dict[str, list[Sample]] = defaultdict(list)
     for sample in samples:
-        groups[sample.group_id or sample.session_id or sample.collection].append(sample)
+        session_groups[session_keys[id(sample)]].append(sample)
 
-    # Union collection groups containing byte-identical images so copies cannot leak
-    # across splits. Every copy remains in the prepared data and manifest.
+    strategy = "collection_session"
+    warning = None
+    sample_group_keys = dict(session_keys)
+    if len(session_groups) < len(names):
+        # AVIS captures made during one running process share a session_id.
+        # Keep exact duplicates together, but fall back to per-image groups so
+        # a single capture run can still produce non-empty train/val/test splits.
+        image_groups: dict[str, list[Sample]] = defaultdict(list)
+        sample_group_keys = {}
+        for index, sample in enumerate(samples):
+            digest = sample.content_hash
+            if not digest:
+                image_path = Path(sample.image).expanduser()
+                if image_path.is_file():
+                    file_hash = hashlib.sha256()
+                    with image_path.open("rb") as stream:
+                        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                            file_hash.update(chunk)
+                    digest = file_hash.hexdigest()
+                else:
+                    digest = hashlib.sha256(
+                        str(image_path.resolve()).casefold().encode("utf-8", errors="replace")
+                    ).hexdigest()
+                sample.content_hash = digest
+            key = f"image:{digest}"
+            image_groups[key].append(sample)
+            sample_group_keys[id(sample)] = key
+        groups: dict[str, list[Sample]] = image_groups
+        strategy = "image_level_fallback"
+        warning = (
+            f"Only {len(session_groups)} independent capture session(s) were available for "
+            f"{len(names)} non-empty splits. RoadForge used deterministic image-level splitting; "
+            "exact byte-identical images remain together, but neighbouring video frames can cross "
+            "train/validation/test boundaries. Capture multiple separate AVIS runs for "
+            "session-isolated evaluation."
+        )
+    else:
+        groups = session_groups
+
+    # Union groups containing byte-identical images so copies cannot leak across splits.
     parent = {key: key for key in groups}
 
     def find(key: str) -> str:
@@ -56,7 +100,7 @@ def split_samples(samples: list[Sample], ratios: dict[str, float], seed: int = 4
     for sample in samples:
         if not sample.content_hash:
             continue
-        key = sample.group_id or sample.session_id or sample.collection
+        key = sample_group_keys[id(sample)]
         if sample.content_hash in by_hash:
             left, right = find(key), find(by_hash[sample.content_hash])
             if left != right:
@@ -85,7 +129,8 @@ def split_samples(samples: list[Sample], ratios: dict[str, float], seed: int = 4
     if len(groups) < len(active_names):
         raise ValueError(
             f"Cannot make {len(active_names)} non-empty splits without leakage: "
-            f"only {len(groups)} independent groups remain after town holdout."
+            f"only {len(groups)} independent groups remain after town holdout. "
+            "Remove the holdout constraint or collect more independent images/sessions."
         )
 
     rng = random.Random(seed)
@@ -95,7 +140,6 @@ def split_samples(samples: list[Sample], ratios: dict[str, float], seed: int = 4
     target_total = sum(len(values) for values in groups.values())
     current = Counter()
 
-    # Seed each non-empty requested split with a distinct whole group.
     for (group_id, group_samples), split_name in zip(group_items, ordered_names):
         assigned[group_id] = split_name
         current[split_name] += len(group_samples)
@@ -120,15 +164,14 @@ def split_samples(samples: list[Sample], ratios: dict[str, float], seed: int = 4
 
     split_values = {name: [] for name in ("train", "val", "test")}
     for sample in samples:
-        original_group = sample.group_id or sample.session_id or sample.collection
-        split_values[assigned[aliases[original_group]]].append(sample)
+        group_key = sample_group_keys[id(sample)]
+        split_values[assigned[aliases[group_key]]].append(sample)
 
     expanded_assignment = {original: assigned[merged] for original, merged in aliases.items()}
     return SplitResult(
         split_values["train"], split_values["val"], split_values["test"],
-        expanded_assignment, dict(Counter(assigned.values())),
+        expanded_assignment, dict(Counter(assigned.values())), strategy, warning,
     )
-
 
 def _safe_component(value: str, fallback: str = "item") -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value)).strip("._-")
@@ -261,6 +304,8 @@ def prepare_dataset(
             test=selected_by_split["test"],
             group_assignment=source_split.group_assignment,
             counts=source_split.counts,
+            strategy=source_split.strategy,
+            warning=source_split.warning,
         )
         selection_scores = quality_scores_by_split.get("train", {})
         selected_samples = split.train + split.val + split.test
@@ -379,7 +424,7 @@ def prepare_dataset(
             "format_version": 3,
             "class_map": {str(key): value for key, value in DEFAULT_CLASSES.items()},
             "seed": seed,
-            "strategy": "collection_session",
+            "strategy": split.strategy,
             "holdout_towns": sorted(map(str, holdout_towns)),
             "ignore_label": ignore_label,
             "selection": selection_report,
@@ -395,6 +440,8 @@ def prepare_dataset(
         total_samples = max(1, sum(counts.values()))
         actual_ratios = {part: count / total_samples for part, count in counts.items()}
         warnings = []
+        if split.warning:
+            warnings.append(split.warning)
         if holdout_towns:
             requested_test = float(ratios.get("test", 0))
             actual_test = actual_ratios["test"]
@@ -421,6 +468,7 @@ def prepare_dataset(
             "ignore_label": ignore_label,
             "selection": selection_report,
             "group_count": len(split.group_assignment),
+            "split_strategy": split.strategy,
             "warnings": warnings,
             "source_validation": {
                 "checked": report.checked,

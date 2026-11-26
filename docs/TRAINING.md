@@ -5,13 +5,28 @@ RoadForge provides a GUI-based workflow for preparing data, training YOLO26 sema
 ## 1. Prepare a dataset
 
 1. Open **Dataset Manager**.
-2. Add or select collection roots containing `collection_*` folders, then click **Rescan**.
+2. Add CARLA collection roots or AVIS capture folders (for example `AVIS_RoadForge_Captures`), then click **Rescan**.
 3. Filter collections/towns/weather/traffic as needed.
 4. Open **Dataset Quality & Splits** and run validation.
 5. Review the full report, select only valid pairs, set train/validation/test ratios and a seed, and prepare a dataset copy.
 6. For an unseen-town experiment, select one or more held-out towns. Ensure that enough independent collection sessions remain for every non-empty split.
 
-The default split configuration is 80% train, 10% validation, and 10% test. Whole collection sessions are kept intact; exact duplicate image files are linked across groups using their content hashes.
+The default split configuration is 80% train, 10% validation, and 10% test. Whole collection sessions are kept intact when there are enough independent sessions; exact duplicate image files stay together. For a single AVIS capture session, RoadForge falls back to deterministic image-level splitting and writes a warning because nearby frames may cross partitions.
+
+
+## AVIS image-to-semantic fine-tuning
+
+AVIS images can be used without converting them into fake CARLA collections.
+
+1. In the Data Collector application, open **YOLOPv2 Teacher Labeling**. In the new **Teacher source** field, browse to Documents/AVIS_RoadForge_Captures (or the folder where you saved AVIS captures).
+2. Select your six-output YOLOPv2 ONNX teacher model and choose Auto/CUDA/CPU. Preview one frame before starting batch annotation. The teacher creates four-class masks (background, drivable area, lane lines, vehicles) and writes an annotation manifest into the AVIS capture folder.
+3. In the main RoadForge app, open **Dataset Manager**. Add the same AVIS capture folder as a source root and click **Rescan**. Select the AVIS image set and keep the default filters selected. Town/Weather/Traffic are optional metadata filters; the AVIS scope appears as AVIS and missing CARLA fields remain Unknown.
+4. Open **Dataset Quality & Splits**, validate the image/mask pairs, set train/validation/test ratios, and prepare the dataset. Do not select a held-out town for an AVIS-only dataset.
+5. In **Model & Training**, select your existing semantic checkpoint as the new fine-tuning checkpoint. Use **Start training** for a fresh fine-tuning run. Do not use **Resume selected last.pt** unless you are continuing the same interrupted run with its original dataset YAML.
+
+When all AVIS images come from one running AVIS process, their capture rows share one session_id. RoadForge automatically falls back to deterministic image-level splitting so all three requested splits can still be created. It keeps byte-identical images in one split and writes a warning because nearby video frames can still leak across train/validation/test. For stronger evaluation, capture several independent AVIS runs and use session-isolated splitting; with enough sessions, RoadForge keeps whole AVIS sessions intact.
+
+The YOLOPv2 output is a pseudo-label, not human ground truth. Review visualizations and masks, particularly vehicle silhouettes and challenging lighting. A checkpoint fine-tuned on these labels is still being trained to imitate YOLOPv2 on AVIS imagery; independent human-reviewed test labels are needed for a reliable accuracy claim.
 
 ## 2. Select a semantic model
 

@@ -23,6 +23,41 @@ datasets/
 
 The annotation manifest is written by the offline teacher-labeling stage. Each image entry records annotation status and the output paths, including the canonical combined mask.
 
+
+## AVIS capture folders
+
+RoadForge also accepts ordinary AVIS Engine image captures. Unlike a CARLA Collector collection, an AVIS folder does not need collection_manifest.json, Town/Map metadata, weather, traffic-manager fields, route IDs, or a CARLA Python API.
+
+The AVIS dashboard writes:
+
+```text
+AVIS_RoadForge_Captures/
+├── images/
+│   ├── avis_*.jpg
+│   └── ...
+└── manifest.jsonl
+```
+
+Each JSONL row contains the relative image path, capture time, AVIS process session_id, camera view/version, drive mode, and any telemetry available at capture time. RoadForge uses the session_id for split grouping; optional or absent CARLA fields are left as Unknown rather than fabricated.
+
+The YOLOPv2 Teacher Labeling tab can select this folder directly. It writes the same annotation_manifest.json and four-class masks as it does for CARLA collections, using the AVIS pseudo-scope name:
+
+```text
+AVIS_RoadForge_Captures/
+├── images/
+├── manifest.jsonl
+├── annotation_manifest.json
+└── labels_yolopv2/
+    └── AVIS/
+        ├── drivable_area/
+        ├── lane_lines/
+        ├── vehicle_masks/
+        ├── combined_4class/
+        └── visualizations/
+```
+
+The original images and AVIS manifest are read-only inputs. Teacher outputs are stored beside them. RoadForge Dataset Manager recognizes the folder directly or when its parent directory is selected. The existing four-class mask contract and validation rules remain unchanged.
+
 ## Canonical semantic mask
 
 RoadForge uses a fixed four-class semantic label map:

@@ -52,7 +52,7 @@ class DatasetScanWorker(QThread):
 
     def run(self):
         try:
-            self.progress.emit("Discovering CARLA collection folders…")
+            self.progress.emit("Discovering CARLA collections and AVIS image folders…")
             from .dataset import discover_collections
             result = discover_collections(self.roots)
             self.progress.emit(f"Found {len(result)} collections; preparing sample index…")
@@ -255,7 +255,7 @@ class TrainingWorker(QThread):
                 transfer = runtime.transfer_report(checkpoint, target_classes=len(model_cfg.get("classes", {})))
             else:
                 # YAML configs are local architecture definitions; no checkpoint is fetched.
-                compat = {"task": "semantic", "architecture": "YOLO26 semantic YAML", "source_classes": 19, "target_classes": 3, "class_adaptation_required": True}
+                compat = {"task": "semantic", "architecture": "YOLO26 semantic YAML", "source_classes": None, "target_classes": len(model_cfg.get("classes", {})), "class_adaptation_required": True}
                 transfer = {"transferred_count": 0, "transferred": [], "modified_count": 0, "modified": [], "initialized_count": 0, "initialized": [], "skipped_count": 0, "skipped": [], "note": "Training starts from the selected architecture with random initialization."}
             self._write_log(f"Starting {run_id} · model={model_spec} · dataset={self.data_yaml}")
             self._write_log(f"Checkpoint compatibility: task={compat.get('task')} · source classes={compat.get('source_classes')} · target classes={compat.get('target_classes')}")

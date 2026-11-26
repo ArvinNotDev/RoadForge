@@ -70,3 +70,15 @@ synchronous frame and verifies the active values through `world.get_weather()`. 
 preset or a server-side mismatch is reported as an error instead of silently keeping the
 map's previous weather. The `Default` option intentionally leaves the map/current-world
 weather unchanged.
+
+
+## Annotate images collected by AVIS Engine
+
+The Teacher Labeling tab supports folders of ordinary images, including AVIS Engine captures. It does not need a CARLA collection_manifest.json or CARLA-specific fields.
+
+1. Start the Data Collector application using run_collector.bat. A CARLA connection does not need to be active for offline annotation.
+2. In **YOLOPv2 Teacher Labeling**, set **Teacher source** to the AVIS capture folder, by default Documents/AVIS_RoadForge_Captures.
+3. Select the compatible YOLOPv2 six-output ONNX model, execution provider, and vehicle-label options. Preview a source image, then select the AVIS scope in the tree and start annotation.
+4. Teacher masks and the annotation manifest are written next to the AVIS images under labels_yolopv2/AVIS/. The original images and manifest.jsonl are not modified.
+
+Open the same AVIS capture folder as a source root in the main RoadForge app, rescan, validate the four-class image/mask pairs, then prepare the train/validation/test split. See docs/TRAINING.md for fine-tuning an existing semantic checkpoint and the warning used when all frames belong to one AVIS session.

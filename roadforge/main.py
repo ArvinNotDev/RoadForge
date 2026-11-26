@@ -242,7 +242,7 @@ class MainWindow(QMainWindow):
             self.dashboard_cards[key] = card
             cards.addWidget(card, index // 4, index % 4)
         layout.addLayout(cards)
-        self.dashboard_info = QLabel("Scanning the selected CARLA data roots…")
+        self.dashboard_info = QLabel("Scanning the selected CARLA and AVIS data roots…")
         self.dashboard_info.setWordWrap(True)
         self.dashboard_info.setObjectName("Muted")
         layout.addWidget(self.dashboard_info)
@@ -261,15 +261,16 @@ class MainWindow(QMainWindow):
         root_group = QGroupBox("Read-only source roots")
         root_row = QHBoxLayout(root_group)
         self.roots_edit = QLineEdit()
-        self.roots_edit.setPlaceholderText("One dataset collection root per line")
-        self.roots_edit.setToolTip("Source image and annotation folders are only read. New collections appear after Rescan.")
+        self.roots_edit.setPlaceholderText("One CARLA collection root or AVIS capture folder per line")
+        self.roots_edit.setToolTip("Source folders are only read. CARLA collection_* folders and AVIS image folders (images/ + optional manifest.jsonl) are both supported.")
         root_row.addWidget(self.roots_edit, 1)
         root_row.addWidget(button("Browse root…", self._browse_roots))
+        root_row.addWidget(button("Add AVIS capture folder…", self._browse_avis_capture_root))
         self.rescan_button = button("Rescan", self.rescan, primary=True)
         root_row.addWidget(self.rescan_button)
         layout.addWidget(root_group)
         selectors = QHBoxLayout()
-        town_box = QGroupBox("Towns · multi-select")
+        town_box = QGroupBox("Scope / Town · multi-select")
         town_layout = QVBoxLayout(town_box)
         self.town_filter = QListWidget()
         town_layout.addWidget(self.town_filter)
@@ -698,6 +699,21 @@ class MainWindow(QMainWindow):
             self.roots_edit.setText("\n".join(values))
             self.settings_roots.setPlainText("\n".join(values))
 
+    def _browse_avis_capture_root(self):
+        default = Path.home() / "Documents" / "AVIS_RoadForge_Captures"
+        root = QFileDialog.getExistingDirectory(
+            self,
+            "Select AVIS_RoadForge_Captures",
+            str(default if default.is_dir() else Path.home() / "Documents"),
+        )
+        if root:
+            values = [value for value in self.roots_edit.text().splitlines() if value.strip()]
+            if root not in values:
+                values.append(root)
+            self.roots_edit.setText("\n".join(values))
+            self.settings_roots.setPlainText("\n".join(values))
+            self._append_log(f"Added AVIS capture folder as a read-only dataset root: {root}")
+
     def _choose_file(self, widget: QLineEdit, filter_text: str):
         path, _ = QFileDialog.getOpenFileName(self, "Select file", str(PROJECT_ROOT), filter_text)
         if path:
@@ -760,7 +776,7 @@ class MainWindow(QMainWindow):
         return [Path(v.strip()).expanduser() for v in self.roots_edit.text().splitlines() if v.strip()]
 
     def rescan(self):
-        if not self._start_busy("Scanning CARLA collections…"):
+        if not self._start_busy("Scanning CARLA and AVIS datasets…"):
             return
         roots = [str(p) for p in self._dataset_roots()]
         worker = DatasetScanWorker(roots)
@@ -796,12 +812,16 @@ class MainWindow(QMainWindow):
             item = QListWidgetItem(town); item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(Qt.CheckState.Checked if town in held_out else Qt.CheckState.Unchecked)
             self.holdout_towns.addItem(item)
+        avis_only = bool(towns) and all(town == "AVIS" for town in towns)
+        self.holdout_towns.setEnabled(not avis_only)
+        if avis_only:
+            self._check_list(self.holdout_towns, False)
         total_images = sum(c.image_count for c in collections); total_annotated = sum(c.annotated_count for c in collections)
         self.dataset_summary.setText(f"{len(collections)} collections · {total_images:,} images · {total_annotated:,} manifest-declared combined masks")
         self.dashboard_cards["collections"].value_label.setText(f"{len(collections):,}")
         self.dashboard_cards["images"].value_label.setText(f"{total_images:,}")
         self.dashboard_cards["annotated"].value_label.setText(f"{total_annotated:,}")
-        self.dashboard_info.setText("Collections are indexed from the selected roots. Source images and annotations remain read only; prepared copies are written under the Studio workspace.")
+        self.dashboard_info.setText("CARLA collections and AVIS image folders are indexed from the selected roots. Source images and annotations remain read only; prepared copies are written under the Studio workspace.")
         self.busy_text.setText("Ready"); self.statusBar().showMessage("Collection scan complete", 7000)
         self._append_log(f"Scanned {len(collections)} collections, {total_images} images, {total_annotated} annotated pairs")
 

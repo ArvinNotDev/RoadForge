@@ -82,17 +82,53 @@ def _safe_manifest_path(collection: Path, value: str) -> Path | None:
 
 
 def discover_collections(dataset_roots: Iterable[str | Path]) -> list[CollectionSummary]:
-    """Discover raw CARLA collections and only use manifest-declared combined masks."""
+    """Discover CARLA collections and AVIS image folders with optional JSONL metadata.
+
+    A generic image dataset is recognized by an images/ directory. Its manifest
+    is optional and is never required to contain CARLA-specific fields. When AVIS
+    provides a session_id, it is retained for leakage-aware splitting.
+    """
     summaries: list[CollectionSummary] = []
     seen_paths: set[Path] = set()
+
+    def has_direct_images(folder: Path) -> bool:
+        return any(
+            path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+            for path in folder.iterdir()
+        )
+
     for root_value in dataset_roots:
         root = Path(root_value).expanduser()
         if not root.is_dir():
             continue
-        for collection in sorted(root.glob("collection_*")):
+
+        candidates: list[Path] = []
+        if (root / "collection_manifest.json").is_file() or (root / "raw").is_dir():
+            candidates.append(root)
+        elif (root / "images").is_dir() or has_direct_images(root):
+            candidates.append(root)
+        else:
+            candidates.extend(sorted(root.glob("collection_*")))
+            candidates.extend(
+                child for child in sorted(root.iterdir())
+                if child.is_dir()
+                and child not in candidates
+                and (
+                    (child / "collection_manifest.json").is_file()
+                    or (child / "raw").is_dir()
+                    or (child / "images").is_dir()
+                )
+            )
+
+        for collection in candidates:
             if not collection.is_dir() or collection.resolve() in seen_paths:
                 continue
             seen_paths.add(collection.resolve())
+            is_carla = (collection / "raw").is_dir()
+            generic_image_dir = collection / "images"
+            if not is_carla and not generic_image_dir.is_dir():
+                generic_image_dir = collection
+
             try:
                 manifest = json.loads((collection / "collection_manifest.json").read_text(encoding="utf-8-sig"))
             except (OSError, json.JSONDecodeError):
@@ -108,54 +144,84 @@ def discover_collections(dataset_roots: Iterable[str | Path]) -> list[Collection
 
             metadata_by_path: dict[str, dict] = {}
             metadata_by_filename: dict[str, dict] = {}
-            for metadata_file in collection.glob("raw/*/metadata.jsonl"):
-                try:
-                    with metadata_file.open("r", encoding="utf-8-sig") as stream:
-                        for line in stream:
-                            try:
-                                record = json.loads(line)
-                            except json.JSONDecodeError:
-                                continue
-                            rel = (Path("raw") / metadata_file.parent.name / "images" / str(record.get("filename", ""))).as_posix()
-                            metadata_by_path[rel] = record
-                            if record.get("filename"):
-                                metadata_by_filename[str(record["filename"])] = record
-                except OSError:
-                    continue
+            if is_carla:
+                metadata_files = collection.glob("raw/*/metadata.jsonl")
+                for metadata_file in metadata_files:
+                    try:
+                        with metadata_file.open("r", encoding="utf-8-sig") as stream:
+                            for line in stream:
+                                try:
+                                    record = json.loads(line)
+                                except json.JSONDecodeError:
+                                    continue
+                                rel = (
+                                    Path("raw") / metadata_file.parent.name / "images"
+                                    / str(record.get("filename", ""))
+                                ).as_posix()
+                                metadata_by_path[rel] = record
+                                if record.get("filename"):
+                                    metadata_by_filename[str(record["filename"])] = record
+                    except OSError:
+                        continue
+            else:
+                capture_manifest = collection / "manifest.jsonl"
+                if capture_manifest.is_file():
+                    try:
+                        with capture_manifest.open("r", encoding="utf-8-sig") as stream:
+                            for line in stream:
+                                try:
+                                    record = json.loads(line)
+                                except json.JSONDecodeError:
+                                    continue
+                                relative = str(record.get("image") or "").replace("\\", "/")
+                                if not relative and record.get("filename"):
+                                    relative = (Path("images") / str(record["filename"])).as_posix()
+                                if relative:
+                                    metadata_by_path[relative] = record
+                                if record.get("filename"):
+                                    metadata_by_filename[str(record["filename"])] = record
+                    except OSError:
+                        pass
 
             session_id = str(manifest.get("session_id") or collection.name)
+            if is_carla:
+                image_sets = [
+                    (town_dir.name, town_dir / "images")
+                    for town_dir in sorted((collection / "raw").glob("*"))
+                    if (town_dir / "images").is_dir()
+                ]
+            else:
+                image_sets = [("AVIS", generic_image_dir)]
+
             samples: list[Sample] = []
             seen_rel: set[str] = set()
-            for town_dir in sorted((collection / "raw").glob("*")) if (collection / "raw").is_dir() else []:
-                image_dir = town_dir / "images"
+            for scope_name, image_dir in image_sets:
                 if not image_dir.is_dir():
                     continue
-                for image in sorted(p for p in image_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS):
+                for image in sorted(
+                    p for p in image_dir.iterdir()
+                    if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+                ):
                     rel = image.relative_to(collection).as_posix()
                     seen_rel.add(rel)
                     entry = annotation_entries.get(rel, {})
                     mask = None
                     status = str(entry.get("status", "missing"))
-                    # Only a committed four-class teacher target is eligible for the
-                    # current YOLO26-sem training contract.
                     combined = entry.get("combined_mask") if status == "success" else None
                     mask_path = _safe_manifest_path(collection, str(combined)) if combined else None
                     if mask_path and mask_path.is_file():
                         mask = str(mask_path)
                     elif not entry:
-                        # Support manifest-free imports while preferring the newest
-                        # four-class labels. Old three-class labels remain discoverable
-                        # for audit/upgrade but validation will block their use for training.
-                        candidate_v4 = collection / "labels_yolopv2" / town_dir.name / "combined_4class" / image.name
-                        candidate_v3 = collection / "labels_yolopv2" / town_dir.name / "combined_3class" / image.name
+                        candidate_v4 = collection / "labels_yolopv2" / scope_name / "combined_4class" / image.name
+                        candidate_v3 = collection / "labels_yolopv2" / scope_name / "combined_3class" / image.name
                         if candidate_v4.is_file():
                             mask = str(candidate_v4)
                             status = "discovered_combined_4class"
                         elif candidate_v3.is_file():
                             mask = str(candidate_v3)
                             status = "discovered_combined_3class"
-                    metadata = metadata_by_path.get(rel, metadata_by_filename.get(image.name, {}))
-                    metadata = dict(metadata)
+
+                    metadata = dict(metadata_by_path.get(rel, metadata_by_filename.get(image.name, {})))
                     if entry:
                         metadata["_annotation_original_image"] = entry.get("original_image")
                         metadata["_annotation_class_map"] = entry.get("class_map")
@@ -178,29 +244,43 @@ def discover_collections(dataset_roots: Iterable[str | Path]) -> list[Collection
                         metadata["_annotation_num_classes"] = 4
                     elif status == "discovered_combined_3class":
                         metadata["_annotation_legacy"] = True
-                    town = str(metadata.get("town", town_dir.name))
+
+                    town = str(metadata.get("town", scope_name if is_carla else "AVIS"))
                     traffic_obj = metadata.get("traffic_manager", {})
-                    traffic_value = traffic_obj.get("vehicle_count", traffic_obj.get("traffic_level", "Unknown")) if isinstance(traffic_obj, dict) else "Unknown"
+                    traffic_value = (
+                        traffic_obj.get("vehicle_count", traffic_obj.get("traffic_level", "Unknown"))
+                        if isinstance(traffic_obj, dict) else "Unknown"
+                    )
                     if traffic_value == "Unknown" and "background_traffic" in collection_config:
-                        traffic_value = (f"Background traffic ({collection_config.get('background_vehicle_count', 'unknown')} vehicles)"
-                                         if collection_config.get("background_traffic") else "No background traffic")
+                        traffic_value = (
+                            f"Background traffic ({collection_config.get('background_vehicle_count', 'unknown')} vehicles)"
+                            if collection_config.get("background_traffic") else "No background traffic"
+                        )
                     route_id = str(metadata.get("route_id", metadata.get("spawn_point_id", "Unknown")))
+                    sample_session = str(
+                        metadata.get("collection_session_id")
+                        or metadata.get("session_id")
+                        or session_id
+                    )
                     samples.append(Sample(
                         image=str(image), mask=mask, collection=str(collection), town=town,
-                        session_id=str(metadata.get("collection_session_id", session_id)),
-                        group_id=str(metadata.get("collection_session_id", session_id)), filename=image.name,
-                        weather=str(metadata.get("weather", "Unknown")), traffic=str(traffic_value),
-                        route_id=route_id, annotation_status=status, metadata=metadata,
+                        session_id=sample_session, group_id=sample_session, filename=image.name,
+                        weather=str(metadata.get("weather", "Unknown")),
+                        traffic=str(traffic_value), route_id=route_id,
+                        annotation_status=status, metadata=metadata,
                     ))
-            # Preserve annotation-manifest entries whose source image disappeared so
-            # validation can report missing images instead of silently dropping them.
+
             for rel, entry in annotation_entries.items():
-                if rel in seen_rel or not str(rel).replace("\\", "/").startswith("raw/"):
+                if rel in seen_rel:
                     continue
-                image = _safe_manifest_path(collection, str(rel))
+                normalized_rel = str(rel).replace("\\", "/")
+                if not (normalized_rel.startswith("raw/") or normalized_rel.startswith("images/")):
+                    continue
+                image = _safe_manifest_path(collection, normalized_rel)
                 if image is None:
                     continue
-                town = Path(str(rel)).parts[1] if len(Path(str(rel)).parts) > 1 else "Unknown"
+                parts = Path(normalized_rel).parts
+                town = parts[1] if parts[0] == "raw" and len(parts) > 1 else "AVIS"
                 mask = _safe_manifest_path(collection, str(entry.get("combined_mask", ""))) if entry.get("status") == "success" else None
                 metadata = {
                     "_annotation_original_image": entry.get("original_image"),
@@ -211,11 +291,15 @@ def discover_collections(dataset_roots: Iterable[str | Path]) -> list[Collection
                         or "3" not in entry.get("class_map", {})
                     ),
                 }
-                samples.append(Sample(str(image), str(mask) if mask else None, str(collection), town, session_id, session_id,
-                                      image.name, "Unknown", "Unknown", "Unknown", str(entry.get("status", "missing")), metadata))
-            weather = sorted({s.weather for s in samples})
-            traffic = sorted({s.traffic for s in samples})
-            towns = sorted({s.town for s in samples})
+                samples.append(Sample(
+                    str(image), str(mask) if mask else None, str(collection), town,
+                    session_id, session_id, image.name, "Unknown", "Unknown",
+                    "Unknown", str(entry.get("status", "missing")), metadata,
+                ))
+
+            weather = sorted({sample.weather for sample in samples})
+            traffic = sorted({sample.traffic for sample in samples})
+            towns = sorted({sample.town for sample in samples})
             dimensions: set[str] = set()
             for sample in samples:
                 dims = sample.metadata.get("camera_resolution")
@@ -223,12 +307,11 @@ def discover_collections(dataset_roots: Iterable[str | Path]) -> list[Collection
                     dimensions.add(f"{dims[0]}×{dims[1]}")
             summaries.append(CollectionSummary(
                 path=str(collection), name=collection.name, towns=towns,
-                image_count=len(samples), annotated_count=sum(s.mask is not None for s in samples),
-                missing_mask_count=sum(s.mask is None for s in samples), weather=weather,
+                image_count=len(samples), annotated_count=sum(sample.mask is not None for sample in samples),
+                missing_mask_count=sum(sample.mask is None for sample in samples), weather=weather,
                 traffic=traffic, dimensions=sorted(dimensions), session_id=session_id, samples=samples,
             ))
     return summaries
-
 
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()

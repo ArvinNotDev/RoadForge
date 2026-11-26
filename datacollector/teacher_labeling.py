@@ -17,16 +17,48 @@ INPUT_WIDTH, INPUT_HEIGHT = 640, 384  # fallback for dynamic ONNX input shapes
 
 
 def discover_collections(dataset_root, stop_event=None):
-    """Return collection -> town -> original image paths for raw collection trees.
+    """Discover CARLA collections and ordinary image folders such as AVIS captures.
 
-    Accept both a dataset root containing collection_* folders and an individual
-    collection folder selected directly in the GUI.
+    An AVIS capture folder only needs an images/ directory. Its optional
+    manifest.jsonl is kept as source metadata; no CARLA collection manifest,
+    Town, Map, Weather, or route metadata is required.
     """
     result = {}
     root = Path(dataset_root).expanduser()
     if not root.is_dir():
         return result
-    candidates = [root] if (root / "collection_manifest.json").is_file() else sorted(root.glob("collection_*"))
+
+    def has_images(folder):
+        image_dir = folder / "images"
+        if image_dir.is_dir() and any(
+            path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+            for path in image_dir.iterdir()
+        ):
+            return True
+        return any(
+            path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+            for path in folder.iterdir()
+        )
+
+    if (
+        (root / "collection_manifest.json").is_file()
+        or (root / "raw").is_dir()
+        or has_images(root)
+    ):
+        candidates = [root]
+    else:
+        candidates = sorted(root.glob("collection_*"))
+        candidates.extend(
+            child for child in sorted(root.iterdir())
+            if child.is_dir()
+            and child not in candidates
+            and (
+                (child / "collection_manifest.json").is_file()
+                or (child / "raw").is_dir()
+                or has_images(child)
+            )
+        )
+
     for collection in candidates:
         if stop_event is not None and stop_event.is_set():
             break
@@ -40,13 +72,25 @@ def discover_collections(dataset_root, stop_event=None):
                     break
                 image_dir = town_dir / "images"
                 if image_dir.is_dir():
-                    images = sorted(p for p in image_dir.iterdir()
-                                    if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS)
+                    images = sorted(
+                        p for p in image_dir.iterdir()
+                        if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+                    )
                     if images:
                         towns[town_dir.name] = images
+        else:
+            image_dir = collection / "images"
+            if not image_dir.is_dir():
+                # Also accept a folder containing image files directly.
+                image_dir = collection
+            images = sorted(
+                p for p in image_dir.iterdir()
+                if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+            )
+            if images:
+                towns["AVIS"] = images
         result[collection] = towns
     return result
-
 
 def _atomic_png(path, image):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -800,7 +844,7 @@ class AnnotationWorker(QThread):
                     stats["success"] += 1
                     stats["vehicle_detections"] = stats.get("vehicle_detections", 0) + len(detections)
                     stats["vehicle_fallbacks"] = stats.get("vehicle_fallbacks", 0) + int(result["vehicle_mask_fallbacks"])
-                    scope_key = f"{collection.name}|{image_path.parent.parent.name}"
+                    scope_key = f"{collection.name}|{town}"
                     scopes[scope_key]["success"] += 1
                     if stats["success"] % self.preview_interval == 0:
                         self.preview.emit({
@@ -826,7 +870,7 @@ class AnnotationWorker(QThread):
                             "failed_at": datetime.now().astimezone().isoformat(),
                         }
                     stats["failed"] += 1
-                    scope_key = f"{collection.name}|{image_path.parent.parent.name}"
+                    scope_key = f"{collection.name}|{town}"
                     scopes[scope_key]["failed"] += 1
                     self.log.emit(f"Failed {key}: {exc}")
                 finally:

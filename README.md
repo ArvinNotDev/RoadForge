@@ -295,6 +295,13 @@ Each task gets its own classification head on a shared backbone. A one-task data
 
 For the data contract, annotation details, split behavior, and limitations, see [AVIS Classification](docs/CLASSIFICATION.md).
 
+
+### G. Fine-tune the semantic model on AVIS captures
+
+The YOLOPv2 Teacher and semantic segmentation workflow also accepts images collected from the AVIS Engine browser dashboard. AVIS capture folders are read directly; no CARLA collection metadata or Map/Town setup is required. RoadForge generates the existing four-class pseudo-labels, validates the paired masks, prepares train/validation/test splits, and fine-tunes an existing semantic checkpoint.
+
+See [AVIS semantic fine-tuning](docs/AVIS_SEMANTIC_FINETUNING.md) for the complete workflow and single-session split behavior.
+
 ## Current limitations and scientific cautions
 
 - The teacher output is a pseudo-label. Its quality depends on the teacher checkpoint, ONNX graph, thresholds, preprocessing, and post-processing.

@@ -184,12 +184,31 @@ class MainWindow(QMainWindow):
         vf.addWidget(vehicle_hint, 3, 0, 1, 4)
         layout.addWidget(vehicle_box)
 
+        source_box = QGroupBox("Teacher source · CARLA collections or ordinary image folders")
+        source_layout = QVBoxLayout(source_box)
+        source_row = QHBoxLayout()
+        self.annotation_root = QLineEdit(str(Path.home() / "Documents" / "AVIS_RoadForge_Captures"))
+        self.annotation_root.setPlaceholderText("Select an AVIS capture folder containing images/ and manifest.jsonl")
+        source_browse = QPushButton("Browse image folder…")
+        source_browse.clicked.connect(self._browse_annotation_root)
+        source_row.addWidget(self.annotation_root, 1)
+        source_row.addWidget(source_browse)
+        source_layout.addLayout(source_row)
+        source_hint = QLabel(
+            "AVIS images are accepted directly. No collection_manifest.json, Town, Map, Weather, "
+            "or CARLA metadata is required."
+        )
+        source_hint.setWordWrap(True)
+        source_hint.setObjectName("muted")
+        source_layout.addWidget(source_hint)
+        layout.addWidget(source_box)
+
         split = QSplitter(Qt.Horizontal)
-        selection = QGroupBox("Collections and towns · all selected by default"); sv = QVBoxLayout(selection)
+        selection = QGroupBox("Image folders and scopes · all selected by default"); sv = QVBoxLayout(selection)
         actions = QHBoxLayout()
         for text, checked in (("Select all", True), ("Deselect all", False)):
             button = QPushButton(text); button.clicked.connect(lambda _, state=checked: self._set_collection_checks(state)); actions.addWidget(button)
-        self.rescan_btn = QPushButton("Rescan Collections"); self.rescan_btn.clicked.connect(self._rescan_annotations); actions.addWidget(self.rescan_btn); sv.addLayout(actions)
+        self.rescan_btn = QPushButton("Rescan Image Folder"); self.rescan_btn.clicked.connect(self._rescan_annotations); actions.addWidget(self.rescan_btn); sv.addLayout(actions)
         self.collection_tree = QTreeWidget(); self.collection_tree.setHeaderLabels(["Collection / town", "Images", "Done", "Remaining", "Failed", "Progress"])
         self.collection_tree.itemChanged.connect(self._annotation_selection_changed); sv.addWidget(self.collection_tree)
         split.addWidget(selection)
@@ -316,11 +335,26 @@ class MainWindow(QMainWindow):
         self.model_info.setText(f"Available · {path}" if path.is_file() else f"Model not found · {path}")
         self.model_info.setStyleSheet("color:#86efac" if path.is_file() else "color:#fca5a5")
 
+    def _browse_annotation_root(self):
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Select AVIS capture or image dataset folder",
+            self.annotation_root.text(),
+        )
+        if folder:
+            self.annotation_root.setText(folder)
+            self._rescan_annotations()
+
     def _rescan_annotations(self):
         if self.annotation_scan_worker and self.annotation_scan_worker.isRunning():
             return
         self._update_model_availability()
-        root = Path(self.output.text()).expanduser()
+        root = Path(self.annotation_root.text()).expanduser()
+        if not root.is_dir():
+            self.label_status.setText("Image folder missing")
+            self.annotation_logs.appendPlainText(f"Image source folder does not exist: {root}")
+            self._finish_annotation_scan_ui()
+            return
         worker = CollectionScanWorker(root, self)
         self.annotation_scan_worker = worker
         worker.result.connect(self._annotations_scanned)
