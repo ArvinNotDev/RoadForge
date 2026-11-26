@@ -293,7 +293,7 @@ def test_avis_collector_annotations_inside_images_subfolder_are_discovered_from_
     collections = discover_collections([capture_root])
     assert len(collections) == 1
     sample = collections[0].samples[0]
-    assert sample.image.endswith(image_rel)
+    assert Path(sample.image).relative_to(capture_root).as_posix() == image_rel
     assert sample.mask == str(mask_path)
     assert sample.metadata["_annotation_original_image"] == image_rel
 
