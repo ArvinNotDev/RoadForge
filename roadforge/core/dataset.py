@@ -143,6 +143,22 @@ def discover_collections(dataset_roots: Iterable[str | Path]) -> list[Collection
             annotation_roots = [collection]
             if not is_carla and generic_image_dir != collection:
                 annotation_roots.append(generic_image_dir)
+            # Dataset Manager also allows users to select the images/ directory
+            # itself. In that layout the Teacher may have been run from the
+            # capture root, so its manifest and labels live in the parent folder.
+            if (
+                not is_carla
+                and collection.name.casefold() == "images"
+                and collection.parent != collection
+                and (
+                    (collection.parent / "annotation_manifest.json").is_file()
+                    or (collection.parent / "labels_yolopv2").is_dir()
+                )
+            ):
+                annotation_roots.append(collection.parent)
+            # Keep each physical manifest root only once while preserving
+            # precedence: selected collection first, then nested/parent roots.
+            annotation_roots = list(dict.fromkeys(path.resolve() for path in annotation_roots))
             for annotation_root in annotation_roots:
                 try:
                     annotations = json.loads(
@@ -224,19 +240,32 @@ def discover_collections(dataset_roots: Iterable[str | Path]) -> list[Collection
                 ):
                     rel = image.relative_to(collection).as_posix()
                     seen_rel.add(rel)
-                    entry = annotation_entries_by_root.get(collection, {}).get(rel, {})
-                    annotation_root = collection
+                    entry = {}
+                    annotation_root = collection.resolve()
                     manifest_key = rel
-                    if (
-                        not entry
-                        and not is_carla
-                        and generic_image_dir != collection
-                    ):
-                        nested_entry = annotation_entries_by_root.get(generic_image_dir, {}).get(image.name, {})
-                        if nested_entry:
-                            entry = nested_entry
-                            annotation_root = generic_image_dir
-                            manifest_key = image.name
+                    # Match an annotation entry relative to the root that
+                    # actually owns its manifest. This handles both:
+                    #   capture root selected -> images/<name> in parent manifest
+                    #   images/ selected      -> images/<name> in parent manifest
+                    # as well as manifests written directly inside images/.
+                    for candidate_root in annotation_roots:
+                        try:
+                            relative_image = image.relative_to(candidate_root).as_posix()
+                        except ValueError:
+                            continue
+                        candidate_keys = [relative_image]
+                        if image.name not in candidate_keys:
+                            candidate_keys.append(image.name)
+                        candidate_entries = annotation_entries_by_root.get(candidate_root, {})
+                        for candidate_key in candidate_keys:
+                            candidate_entry = candidate_entries.get(candidate_key)
+                            if isinstance(candidate_entry, dict) and candidate_entry:
+                                entry = candidate_entry
+                                annotation_root = candidate_root
+                                manifest_key = candidate_key
+                                break
+                        if entry:
+                            break
 
                     mask = None
                     status = str(entry.get("status", "missing"))
@@ -251,12 +280,17 @@ def discover_collections(dataset_roots: Iterable[str | Path]) -> list[Collection
                         if alternate_mask_path and alternate_mask_path.is_file():
                             mask = str(alternate_mask_path)
                     if mask is None and not entry:
-                        candidate_roots = [collection]
-                        if not is_carla and generic_image_dir != collection:
-                            candidate_roots.append(generic_image_dir)
-                        for candidate_root in candidate_roots:
+                        for candidate_root in annotation_roots:
                             candidate_v4 = candidate_root / "labels_yolopv2" / scope_name / "combined_4class" / image.name
+                            candidate_v4_processed = (
+                                candidate_root / "labels_yolopv2" / scope_name
+                                / "combined_4class_no_vehicles" / image.name
+                            )
                             candidate_v3 = candidate_root / "labels_yolopv2" / scope_name / "combined_3class" / image.name
+                            if candidate_v4_processed.is_file():
+                                mask = str(candidate_v4_processed)
+                                status = "discovered_combined_4class"
+                                break
                             if candidate_v4.is_file():
                                 mask = str(candidate_v4)
                                 status = "discovered_combined_4class"
@@ -269,10 +303,20 @@ def discover_collections(dataset_roots: Iterable[str | Path]) -> list[Collection
                     metadata = dict(metadata_by_path.get(rel, metadata_by_filename.get(image.name, {})))
                     if entry:
                         declared_image = str(entry.get("original_image") or "").replace("\\", "/")
-                        if manifest_key != rel and declared_image == manifest_key:
-                            # This entry was keyed relative to images/; normalize
-                            # it to the collection root for pair-integrity checks.
-                            declared_image = rel
+                        if declared_image:
+                            # Validation compares image paths relative to the
+                            # selected Dataset Manager folder, not the manifest
+                            # owner. Normalize parent-root paths such as
+                            # images/frame.jpg to the selected images/ folder's
+                            # local frame.jpg path.
+                            try:
+                                annotation_relative_image = image.relative_to(annotation_root).as_posix()
+                            except ValueError:
+                                annotation_relative_image = rel
+                            if declared_image in {
+                                manifest_key, annotation_relative_image, image.name,
+                            }:
+                                declared_image = rel
                         metadata["_annotation_original_image"] = declared_image or rel
                         metadata["_annotation_class_map"] = entry.get("class_map")
                         metadata["_annotation_num_classes"] = entry.get("num_classes")
