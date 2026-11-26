@@ -71,7 +71,21 @@ Outputs are stored under:
 
 The checkpoint contains the backbone, task names, class order, input size, normalization values, and model weights. Use load_classifier_checkpoint from roadforge.classification_training to reconstruct the matching architecture.
 
-## 5. Split policy and limitations
+## 5. Export an AVIS classifier to ONNX
+
+The **ONNX Export** page supports Classification Lab checkpoints as well as the existing Ultralytics semantic checkpoints. Select the AVIS run's best.pt file and click **Export + validate**. RoadForge detects the checkpoint format from its saved fields; no Ultralytics wrapper, retraining, or checkpoint conversion is required.
+
+For AVIS classification, the exporter reads the backbone, task schema, input size, and ImageNet normalization values directly from the checkpoint. With the example configuration, the graph has:
+
+- One input named images: float32 RGB in NCHW layout, shape [batch, 3, 224, 224].
+- One output per task, in checkpoint task order. For the example schema, the outputs are logits_obstacle_ahead and logits_lane, each with shape [batch, 2].
+- Raw logits, not probabilities. Apply softmax independently to each output when probabilities are needed; argmax selects a class index.
+
+The input preprocessing must match training: convert the source image to RGB, resize directly to 224×224 (no letterbox), convert pixels to float32 in [0, 1], then normalize each channel with the checkpoint's mean and std values. The ONNX graph embeds the task/class order and preprocessing metadata in its model metadata. Dynamic export changes the batch dimension only; the trained spatial input remains fixed.
+
+Before reporting success, RoadForge checks the ONNX graph, loads it with ONNX Runtime, runs a smoke inference, checks every task output's shape and finite values, and compares each ONNX output against the original PyTorch model. The semantic-only parity viewer and deployment-package generator remain specific to the semantic-segmentation workflow.
+
+## 6. Split policy and limitations
 
 RoadForge groups images by AVIS process/session whenever at least three sessions are available, keeping complete sessions in one split. With fewer than three sessions, it falls back to a deterministic image-level split and emits a warning; temporally adjacent frames can then leak across partitions. For meaningful evaluation, collect multiple separate AVIS runs and reserve unseen sessions for validation and test.
 
