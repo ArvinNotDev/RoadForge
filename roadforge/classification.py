@@ -76,6 +76,7 @@ class ClassificationPage(QWidget):
         self.tasks: list[dict[str, Any]] = []
         self.samples: list[dict[str, Any]] = []
         self.current_index = 0
+        self._last_annotation_labels: dict[str, str] = {}
         self.worker: ClassificationTrainingWorker | None = None
         self._build_ui()
         self._load_default_dataset()
@@ -367,6 +368,31 @@ class ClassificationPage(QWidget):
                 return index
         return max(0, len(self.samples) - 1)
 
+    @staticmethod
+    def _default_annotation_selection(task: dict[str, Any]) -> str:
+        """Choose useful AVIS defaults while respecting each task's configured classes."""
+        classes = {
+            str(class_name).casefold(): str(class_name)
+            for class_name in task.get("classes", [])
+        }
+        task_name = str(task.get("name", "")).casefold()
+        if "obstacle" in task_name and "yes" in classes:
+            return classes["yes"]
+        if "right" in task_name or "lane" in task_name:
+            if "right" in classes:
+                return classes["right"]
+            if "yes" in classes:
+                return classes["yes"]
+        if "right" in classes:
+            return classes["right"]
+        return ""
+
+    def _remember_current_annotation_selection(self):
+        for task, combo in self.annotation_combos:
+            selected = str(combo.currentData() or "")
+            if selected in task["classes"]:
+                self._last_annotation_labels[task["key"]] = selected
+
     def _rebuild_annotation_controls(self):
         while self.label_layout.count():
             item = self.label_layout.takeAt(0)
@@ -375,6 +401,11 @@ class ClassificationPage(QWidget):
                 widget.deleteLater()
         self.annotation_combos = []
         for task in self.tasks:
+            remembered = self._last_annotation_labels.get(task["key"], "")
+            if remembered not in task["classes"]:
+                remembered = self._default_annotation_selection(task)
+            if remembered:
+                self._last_annotation_labels[task["key"]] = remembered
             row = QFormLayout()
             combo = QComboBox()
             combo.addItem("— Select class —", "")
@@ -426,8 +457,12 @@ class ClassificationPage(QWidget):
         labels = sample.get("labels", {})
         for task, combo in self.annotation_combos:
             selected = labels.get(task["key"], "")
+            if selected not in task["classes"]:
+                selected = self._last_annotation_labels.get(task["key"], "")
             index = combo.findData(selected)
             combo.setCurrentIndex(index if index >= 0 else 0)
+            if index >= 0 and selected:
+                self._last_annotation_labels[task["key"]] = selected
         metadata = sample.get("capture_metadata", {})
         captured = sample.get("captured_at") or metadata.get("captured_at") or "time unavailable"
         session = sample.get("session_id") or "unknown session"
@@ -451,12 +486,14 @@ class ClassificationPage(QWidget):
     def previous_image(self):
         if not self.samples:
             return
+        self._remember_current_annotation_selection()
         self.current_index = max(0, self.current_index - 1)
         self._show_current_sample()
 
     def next_image(self):
         if not self.samples:
             return
+        self._remember_current_annotation_selection()
         self.current_index = min(len(self.samples) - 1, self.current_index + 1)
         self._show_current_sample()
 
@@ -477,6 +514,7 @@ class ClassificationPage(QWidget):
         sample = self.samples[self.current_index]
         try:
             save_sample_labels(self.dataset_root, sample["sample_id"], labels)
+            self._last_annotation_labels.update(labels)
             self._reload_samples()
             self._append_log(
                 f"Annotated {Path(sample['image']).name}: "

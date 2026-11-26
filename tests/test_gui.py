@@ -3,10 +3,13 @@ import time
 import pytest
 pytest.importorskip("PySide6")
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QTimer, Qt
+from PySide6.QtGui import QImage
 from PySide6.QtTest import QSignalSpy
 from PySide6.QtWidgets import QApplication
 
+from roadforge.classification import ClassificationPage
+from roadforge.classification_data import validate_tasks
 from roadforge.core.workers import OperationWorker
 from roadforge.main import MainWindow
 
@@ -60,3 +63,36 @@ def test_worker_runs_off_main_thread_and_delivers_errors():
     failure.wait()
     assert errors.count() == 1
     assert "worker test error" in errors.at(0)[0]
+
+
+
+def test_classification_annotation_defaults_to_yes_right_and_remembers_last_choice(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    page = ClassificationPage(tmp_path)
+    page.dataset_root = tmp_path
+    page.tasks = validate_tasks([
+        {"name": "Obstacle ahead", "classes": ["no", "yes"]},
+        {"name": "Current lane", "classes": ["left", "right"]},
+    ])
+    page._rebuild_annotation_controls()
+
+    for filename in ("first.png", "second.png"):
+        image = QImage(32, 24, QImage.Format.Format_RGB32)
+        image.fill(Qt.GlobalColor.black)
+        assert image.save(str(tmp_path / filename))
+
+    page.samples = [
+        {"sample_id": "sample-1", "image": "first.png", "labels": {}, "capture_metadata": {}},
+        {"sample_id": "sample-2", "image": "second.png", "labels": {}, "capture_metadata": {}},
+    ]
+    page.current_index = 0
+    page._show_current_sample()
+    assert [combo.currentData() for _task, combo in page.annotation_combos] == ["yes", "right"]
+
+    page.annotation_combos[0][1].setCurrentIndex(page.annotation_combos[0][1].findData("no"))
+    page.annotation_combos[1][1].setCurrentIndex(page.annotation_combos[1][1].findData("left"))
+    page.next_image()
+    assert [combo.currentData() for _task, combo in page.annotation_combos] == ["no", "left"]
+
+    page.close()
+    app.processEvents()
