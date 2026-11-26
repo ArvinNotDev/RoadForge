@@ -910,7 +910,28 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Split total", "Train, validation, and test percentages must sum to 100%.")
             return
         if not self.validation_report.valid:
-            QMessageBox.warning(self, "No valid pairs", "The validation report contains no valid image-mask pairs.")
+            report = self.validation_report
+            error_issues = [issue for issue in report.issues if issue.severity == "error"]
+            error_counts = {}
+            for issue in error_issues:
+                error_counts[issue.code] = error_counts.get(issue.code, 0) + 1
+            reason_summary = "\n".join(
+                f"  • {code}: {count:,}"
+                for code, count in sorted(error_counts.items(), key=lambda item: (-item[1], item[0]))
+            ) or "  No validation errors were recorded. Check collection selection and filters."
+            examples = []
+            for issue in error_issues[:5]:
+                image_name = Path(issue.image).name if issue.image else "(no image path)"
+                examples.append(f"  • [{issue.code}] {image_name}: {issue.message}")
+            example_text = "\n".join(examples) or "  No error examples are available."
+            QMessageBox.warning(
+                self,
+                "No valid image-mask pairs",
+                f"Validation checked {report.checked:,} sample(s) and accepted 0 pairs.\n\n"
+                f"Error breakdown:\n{reason_summary}\n\n"
+                f"First rejected samples:\n{example_text}\n\n"
+                "Open Quality & Validation and use Export Validation Report for the complete details."
+            )
             return
         try:
             dataset_name = self._safe_config_name(self.dataset_name.text())
