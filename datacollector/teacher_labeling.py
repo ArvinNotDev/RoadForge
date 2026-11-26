@@ -122,7 +122,7 @@ def _sha256_file(path, chunk_size=1024 * 1024):
 
 
 def annotation_outputs_valid(collection, record):
-    """Check a complete four-class annotation transaction, including vehicle masks."""
+    """Validate teacher masks, including reversible vehicle-to-background processing."""
     try:
         expected = (int(record["height"]), int(record["width"]))
         decoded = {}
@@ -140,19 +140,28 @@ def annotation_outputs_valid(collection, record):
         lane = decoded["lane_mask"]
         vehicle = decoded["vehicle_mask"]
         combined = decoded["combined_mask"]
+        postprocessing = record.get("postprocessing") or {}
+        vehicle_class_target = 3
+        if postprocessing:
+            if (
+                postprocessing.get("operation") != "map_class_to_background"
+                or int(postprocessing.get("source_class_id", -1)) != 3
+                or int(postprocessing.get("target_class_id", -1)) != 0
+            ):
+                return False
+            vehicle_class_target = 0
+
         return (
             set(np.unique(drive)).issubset({0, 255})
             and set(np.unique(lane)).issubset({0, 255})
             and set(np.unique(vehicle)).issubset({0, 255})
             and set(np.unique(combined)).issubset({0, 1, 2, 3})
-            # Vehicle class 3 intentionally overrides lane class 2 and drivable
-            # class 1 where detected boxes overlap those regions.
+            # Vehicle pixels normally override the road/lane classes. When the
+            # user maps vehicles to Background, those same pixels must be zero.
             and bool(np.all(combined[(lane > 0) & (vehicle == 0)] == 2))
-            and bool(np.all(combined[vehicle > 0] == 3))
+            and bool(np.all(combined[vehicle > 0] == vehicle_class_target))
             and bool(np.all(combined[(drive > 0) & (lane == 0) & (vehicle == 0)] == 1))
             and record.get("class_map", {}).get("3") == "vehicles"
-            # Regenerate legacy vehicle annotations with the hood-exclusion
-            # pipeline instead of silently skipping masks made with old settings.
             and int(record.get("vehicle_annotation", {}).get("pipeline_version", 0))
                 == DEFAULT_VEHICLE_ANNOTATION_PIPELINE_VERSION
         )
@@ -802,6 +811,10 @@ class AnnotationWorker(QThread):
                             bgr_view = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
                             _atomic_png(visdir / f"{stem}_{name.lower().replace(' ', '_')}.png", bgr_view)
 
+                    # A fresh teacher run replaces the active mask and clears any
+                    # earlier reversible post-processing metadata.
+                    item.pop("original_combined_mask", None)
+                    item.pop("postprocessing", None)
                     item.update({
                         "status": "success", "original_image": key,
                         "drivable_mask": paths["drivable"].relative_to(collection).as_posix(),
@@ -888,3 +901,151 @@ class AnnotationWorker(QThread):
             stats["error"] = f"{type(exc).__name__}: {error_text}"
             self.log.emit(f"Annotation startup error ({stats['error']}):\n{traceback.format_exc()}")
             self.done.emit(stats)
+
+class MaskPostprocessWorker(QThread):
+    """Reversibly map vehicle pixels in successful combined masks to Background."""
+
+    progress = Signal(dict)
+    log = Signal(str)
+    done = Signal(dict)
+
+    VEHICLES_TO_BACKGROUND = "vehicles_to_background"
+    RESTORE_ORIGINAL = "restore_original"
+    OUTPUT_FOLDER = "combined_4class_no_vehicles"
+
+    def __init__(self, jobs, mode=VEHICLES_TO_BACKGROUND, parent=None):
+        super().__init__(parent)
+        self.jobs = list(jobs)
+        self.mode = str(mode)
+        self._stop = threading.Event()
+
+    def stop(self):
+        self._stop.set()
+
+    @staticmethod
+    def _safe_collection_path(collection, relative_path):
+        root = Path(collection).expanduser().resolve()
+        candidate = (root / str(relative_path)).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            return None
+        return candidate
+
+    def run(self):
+        stats = {
+            "total": len(self.jobs), "completed": 0, "processed": 0,
+            "skipped": 0, "failed": 0, "vehicle_pixels": 0,
+            "changed_pixels": 0, "mode": self.mode,
+        }
+        manifests = {}
+        try:
+            if self.mode not in (self.VEHICLES_TO_BACKGROUND, self.RESTORE_ORIGINAL):
+                raise ValueError(f"Unsupported mask post-processing mode: {self.mode}")
+
+            for index, (collection, town, image) in enumerate(self.jobs, start=1):
+                if self._stop.is_set():
+                    stats["stopped"] = True
+                    break
+
+                collection = Path(collection)
+                manifest_path = collection / "annotation_manifest.json"
+                if collection not in manifests:
+                    try:
+                        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError):
+                        manifest = {"format": "yolopv2-annotations-v1", "images": {}}
+                    if not isinstance(manifest.get("images"), dict):
+                        manifest["images"] = {}
+                    manifests[collection] = manifest
+
+                manifest = manifests[collection]
+                key = Path(image).relative_to(collection).as_posix()
+                record = manifest["images"].get(key)
+                try:
+                    if not isinstance(record, dict) or record.get("status") != "success":
+                        raise LookupError("No successful teacher annotation exists for this image.")
+
+                    if self.mode == self.VEHICLES_TO_BACKGROUND:
+                        original_relative = (
+                            record.get("original_combined_mask") or record.get("combined_mask")
+                        )
+                        if not original_relative:
+                            raise ValueError("Annotation manifest has no combined mask path.")
+                        source_path = self._safe_collection_path(collection, original_relative)
+                        if source_path is None or not source_path.is_file():
+                            raise FileNotFoundError(f"Original combined mask not found: {original_relative}")
+
+                        mask = cv2.imread(str(source_path), cv2.IMREAD_GRAYSCALE)
+                        if mask is None:
+                            raise ValueError(f"Could not decode combined mask: {source_path}")
+                        expected = (int(record["height"]), int(record["width"]))
+                        if mask.shape != expected:
+                            raise ValueError(
+                                f"Mask dimensions {mask.shape[::-1]} do not match annotation dimensions "
+                                f"{(expected[1], expected[0])}."
+                            )
+                        unexpected = set(int(value) for value in np.unique(mask)) - {0, 1, 2, 3}
+                        if unexpected:
+                            raise ValueError(f"Combined mask has unsupported class IDs: {sorted(unexpected)}")
+
+                        vehicle_pixels = int(np.count_nonzero(mask == 3))
+                        processed = mask.copy()
+                        processed[processed == 3] = 0
+                        output_path = (
+                            collection / "labels_yolopv2" / str(town)
+                            / self.OUTPUT_FOLDER / source_path.name
+                        )
+                        _atomic_png(output_path, processed)
+
+                        original_relative = Path(original_relative).as_posix()
+                        record["original_combined_mask"] = original_relative
+                        record["combined_mask"] = output_path.relative_to(collection).as_posix()
+                        record["postprocessing"] = {
+                            "operation": "map_class_to_background",
+                            "source_class_id": 3,
+                            "source_class_name": "vehicles",
+                            "target_class_id": 0,
+                            "target_class_name": "background",
+                            "vehicle_pixels_mapped": vehicle_pixels,
+                            "processed_at": datetime.now().astimezone().isoformat(),
+                        }
+                        stats["vehicle_pixels"] += vehicle_pixels
+                        stats["changed_pixels"] += vehicle_pixels
+                    else:
+                        original_relative = record.get("original_combined_mask")
+                        if not original_relative:
+                            raise LookupError("This annotation has no saved original mask to restore.")
+                        original_path = self._safe_collection_path(collection, original_relative)
+                        if original_path is None or not original_path.is_file():
+                            raise FileNotFoundError(f"Saved original mask not found: {original_relative}")
+                        record["combined_mask"] = Path(original_relative).as_posix()
+                        record.pop("original_combined_mask", None)
+                        record.pop("postprocessing", None)
+
+                    # The manifest pointer is updated only after the selected mask
+                    # exists, so Dataset Manager never sees a half-written output.
+                    _atomic_json(manifest_path, manifest)
+                    stats["processed"] += 1
+                    action = (
+                        "Mapped vehicle pixels to Background"
+                        if self.mode == self.VEHICLES_TO_BACKGROUND
+                        else "Restored original vehicle labels"
+                    )
+                    self.log.emit(f"{action}: {key}")
+                except LookupError as exc:
+                    stats["skipped"] += 1
+                    self.log.emit(f"Skipped {key}: {exc}")
+                except Exception as exc:
+                    stats["failed"] += 1
+                    self.log.emit(f"Failed {key}: {exc}")
+
+                stats["completed"] = index
+                self.progress.emit(dict(stats, current=f"{collection.name}/{key}"))
+
+            stats["stopped"] = self._stop.is_set()
+        except Exception as exc:
+            stats["error"] = f"{type(exc).__name__}: {exc}"
+            self.log.emit(f"Mask post-processing failed: {traceback.format_exc()}")
+        self.done.emit(stats)
+

@@ -14,15 +14,15 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBo
 try:  # Supports both `python main.py` and `python -m datacollector.main`.
     from .config import CAMERA_REFERENCE, TOWNS
     from .worker import CarlaWorker
-    from .teacher_labeling import (AnnotationWorker, CollectionScanWorker, YOLOPv2Predictor, create_session,
-        DEFAULT_VEHICLE_SCORE_THRESHOLD, DEFAULT_VEHICLE_NMS_THRESHOLD,
-        DEFAULT_VEHICLE_BOTTOM_KEEP_RATIO, visualization)
+    from .teacher_labeling import (AnnotationWorker, CollectionScanWorker, MaskPostprocessWorker,
+        YOLOPv2Predictor, create_session, DEFAULT_VEHICLE_SCORE_THRESHOLD,
+        DEFAULT_VEHICLE_NMS_THRESHOLD, DEFAULT_VEHICLE_BOTTOM_KEEP_RATIO, visualization)
 except ImportError:
     from config import CAMERA_REFERENCE, TOWNS
     from worker import CarlaWorker
-    from teacher_labeling import (AnnotationWorker, CollectionScanWorker, YOLOPv2Predictor, create_session,
-        DEFAULT_VEHICLE_SCORE_THRESHOLD, DEFAULT_VEHICLE_NMS_THRESHOLD,
-        DEFAULT_VEHICLE_BOTTOM_KEEP_RATIO, visualization)
+    from teacher_labeling import (AnnotationWorker, CollectionScanWorker, MaskPostprocessWorker,
+        YOLOPv2Predictor, create_session, DEFAULT_VEHICLE_SCORE_THRESHOLD,
+        DEFAULT_VEHICLE_NMS_THRESHOLD, DEFAULT_VEHICLE_BOTTOM_KEEP_RATIO, visualization)
 
 
 class MainWindow(QMainWindow):
@@ -34,6 +34,7 @@ class MainWindow(QMainWindow):
         self.worker = None
         self.annotation_worker = None
         self.annotation_scan_worker = None
+        self.mask_postprocess_worker = None
         self.connected = False
         self.town_rows = {}
         self._available_map_names = set()
@@ -227,6 +228,33 @@ class MainWindow(QMainWindow):
         self.preview_legend.setWordWrap(True); pv.addWidget(self.preview_legend)
         split.addWidget(preview_box); split.setSizes([520, 650]); layout.addWidget(split, 1)
 
+        postprocess_box = QGroupBox("Post-process existing annotations")
+        postprocess_layout = QGridLayout(postprocess_box)
+        postprocess_hint = QLabel(
+            "Apply this to the checked image scopes above. Vehicle pixels (class 3) are changed to "
+            "Background (class 0) in the active combined training masks. Original masks are kept "
+            "separately, so you can restore them at any time."
+        )
+        postprocess_hint.setWordWrap(True)
+        postprocess_hint.setObjectName("muted")
+        self.vehicles_to_background_btn = QPushButton("Vehicles → Background (3 → 0)")
+        self.vehicles_to_background_btn.clicked.connect(
+            lambda: self._start_mask_postprocess(MaskPostprocessWorker.VEHICLES_TO_BACKGROUND)
+        )
+        self.restore_vehicle_labels_btn = QPushButton("Restore original vehicle labels")
+        self.restore_vehicle_labels_btn.clicked.connect(
+            lambda: self._start_mask_postprocess(MaskPostprocessWorker.RESTORE_ORIGINAL)
+        )
+        self.mask_postprocess_progress = QProgressBar()
+        self.mask_postprocess_progress.setRange(0, 1000)
+        self.mask_postprocess_status = QLabel("Ready · only successfully annotated images are changed")
+        postprocess_layout.addWidget(postprocess_hint, 0, 0, 1, 2)
+        postprocess_layout.addWidget(self.vehicles_to_background_btn, 1, 0)
+        postprocess_layout.addWidget(self.restore_vehicle_labels_btn, 1, 1)
+        postprocess_layout.addWidget(self.mask_postprocess_progress, 2, 0, 1, 2)
+        postprocess_layout.addWidget(self.mask_postprocess_status, 3, 0, 1, 2)
+        layout.addWidget(postprocess_box)
+
         dash = QGroupBox("Annotation progress"); dv = QGridLayout(dash)
         self.annotation_counts = QLabel("Images: 0 · Annotated: 0 · Remaining: 0 · Skipped: 0 · Failed: 0")
         self.annotation_bar = QProgressBar(); self.annotation_bar.setRange(0, 1000)
@@ -362,6 +390,7 @@ class MainWindow(QMainWindow):
         worker.finished.connect(lambda current=worker: self._annotation_scan_finished(current))
         self.rescan_btn.setEnabled(False)
         self.annotate_start.setEnabled(False)
+        self.vehicles_to_background_btn.setEnabled(False); self.restore_vehicle_labels_btn.setEnabled(False)
         self.label_status.setText("Scanning collections…")
         self.annotation_logs.appendPlainText("Scanning collections and checking existing labels…")
         worker.start()
@@ -377,6 +406,7 @@ class MainWindow(QMainWindow):
         self.rescan_btn.setEnabled(True)
         annotation_running = self.annotation_worker and self.annotation_worker.isRunning()
         self.annotate_start.setEnabled(not annotation_running)
+        self._update_mask_postprocess_buttons()
 
     def _annotations_scanned(self, payload):
         self._finish_annotation_scan_ui()
@@ -412,6 +442,7 @@ class MainWindow(QMainWindow):
             root_item.setData(0, Qt.UserRole, (str(collection), None))
         self.collection_tree.blockSignals(False)
         self._refresh_annotation_totals()
+        self._update_mask_postprocess_buttons()
         if payload.get("stopped"):
             self.label_status.setText("Scan stopped")
         else:
@@ -499,6 +530,9 @@ class MainWindow(QMainWindow):
         self.annotation_preview.setPixmap(QPixmap.fromImage(q).scaled(self.annotation_preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
     def _start_annotation(self):
+        if self.mask_postprocess_worker and self.mask_postprocess_worker.isRunning():
+            QMessageBox.information(self, "Mask processing is running", "Wait for existing mask processing to finish.")
+            return
         jobs = self._selected_annotation_jobs()
         model = Path(self.model_path.text()).expanduser()
         if not model.is_file(): QMessageBox.warning(self, "Model missing", f"ONNX model not found: {model}"); return
@@ -521,7 +555,104 @@ class MainWindow(QMainWindow):
         w.preview.connect(self._annotation_batch_preview); w.done.connect(self._annotation_done)
         self.annotate_start.setEnabled(False); self.annotate_pause.setEnabled(True); self.annotate_resume.setEnabled(False); self.annotate_stop.setEnabled(True)
         self.rescan_btn.setEnabled(False)
+        self.vehicles_to_background_btn.setEnabled(False); self.restore_vehicle_labels_btn.setEnabled(False)
         self.label_status.setText("Starting"); w.start()
+
+    def _update_mask_postprocess_buttons(self):
+        annotation_running = self.annotation_worker and self.annotation_worker.isRunning()
+        scan_running = self.annotation_scan_worker and self.annotation_scan_worker.isRunning()
+        postprocess_running = self.mask_postprocess_worker and self.mask_postprocess_worker.isRunning()
+        enabled = not (annotation_running or scan_running or postprocess_running)
+        self.vehicles_to_background_btn.setEnabled(enabled)
+        self.restore_vehicle_labels_btn.setEnabled(enabled)
+
+    def _start_mask_postprocess(self, mode):
+        if self.annotation_worker and self.annotation_worker.isRunning():
+            QMessageBox.information(self, "Annotation is running", "Stop or finish YOLOPv2 annotation before processing existing masks.")
+            return
+        if self.annotation_scan_worker and self.annotation_scan_worker.isRunning():
+            QMessageBox.information(self, "Scan is running", "Wait for the image-folder scan to finish.")
+            return
+        if self.mask_postprocess_worker and self.mask_postprocess_worker.isRunning():
+            return
+        jobs = self._selected_annotation_jobs()
+        if not jobs:
+            QMessageBox.warning(self, "No image scopes selected", "Select at least one collection or AVIS scope in the tree above.")
+            return
+
+        if mode == MaskPostprocessWorker.VEHICLES_TO_BACKGROUND:
+            title = "Map vehicle labels to Background?"
+            message = (
+                "For every successfully annotated image in the checked scopes, all class-3 vehicle "
+                "pixels in the combined training mask will become class 0 (Background). Original "
+                "combined masks will be preserved and can be restored. Continue?"
+            )
+        else:
+            title = "Restore original vehicle labels?"
+            message = (
+                "Restore the original combined masks for checked scopes. Processed masks will remain "
+                "on disk, but the annotation manifest will point back to the original vehicle labels. Continue?"
+            )
+        answer = QMessageBox.warning(
+            self, title, message, QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if answer != QMessageBox.Yes:
+            return
+
+        worker = MaskPostprocessWorker(jobs, mode, self)
+        self.mask_postprocess_worker = worker
+        worker.log.connect(self.annotation_logs.appendPlainText)
+        worker.progress.connect(self._mask_postprocess_progress)
+        worker.done.connect(self._mask_postprocess_done)
+        worker.finished.connect(lambda current=worker: self._mask_postprocess_finished(current))
+        self.vehicles_to_background_btn.setEnabled(False)
+        self.restore_vehicle_labels_btn.setEnabled(False)
+        self.annotate_start.setEnabled(False)
+        self.rescan_btn.setEnabled(False)
+        self.mask_postprocess_progress.setValue(0)
+        self.mask_postprocess_status.setText("Starting…")
+        self.label_status.setText("Processing masks")
+        worker.start()
+
+    def _mask_postprocess_progress(self, data):
+        total = int(data.get("total", 0))
+        completed = int(data.get("completed", 0))
+        self.mask_postprocess_progress.setRange(0, max(1, total))
+        self.mask_postprocess_progress.setValue(completed)
+        self.mask_postprocess_status.setText(
+            f"{data.get('current', 'Processing…')} · {completed}/{total} · "
+            f"changed vehicle pixels: {data.get('vehicle_pixels', 0):,}"
+        )
+
+    def _mask_postprocess_done(self, stats):
+        if stats.get("error"):
+            self.mask_postprocess_status.setText("Processing failed")
+            self.annotation_logs.appendPlainText(f"Mask processing error: {stats['error']}")
+        else:
+            action = (
+                "Vehicles mapped to Background"
+                if stats.get("mode") == MaskPostprocessWorker.VEHICLES_TO_BACKGROUND
+                else "Original vehicle labels restored"
+            )
+            self.mask_postprocess_status.setText(
+                f"{action} · processed {stats.get('processed', 0)} · "
+                f"skipped {stats.get('skipped', 0)} · failed {stats.get('failed', 0)}"
+            )
+            self.annotation_logs.appendPlainText(
+                f"{action}: {stats.get('processed', 0)} image(s), "
+                f"{stats.get('vehicle_pixels', 0):,} vehicle pixel(s) mapped, "
+                f"{stats.get('failed', 0)} failure(s)."
+            )
+        if stats.get("stopped"):
+            self.annotation_logs.appendPlainText("Mask processing stopped.")
+
+    def _mask_postprocess_finished(self, worker):
+        if self.mask_postprocess_worker is worker:
+            self.mask_postprocess_worker = None
+        self.annotate_start.setEnabled(True)
+        self.rescan_btn.setEnabled(True)
+        self._update_mask_postprocess_buttons()
+        self._rescan_annotations()
 
     def _pause_annotation(self):
         if self.annotation_worker: self.annotation_worker.pause(); self.annotate_pause.setEnabled(False); self.annotate_resume.setEnabled(True); self.label_status.setText("Paused"); self.annotation_logs.appendPlainText("Paused.")
@@ -755,6 +886,12 @@ class MainWindow(QMainWindow):
         self._update_collection_availability()
 
     def closeEvent(self,event):
+        if self.mask_postprocess_worker and self.mask_postprocess_worker.isRunning():
+            self.mask_postprocess_worker.stop()
+            if not self.mask_postprocess_worker.wait(5000):
+                event.ignore()
+                self.annotation_logs.appendPlainText("Waiting for mask processing to stop before closing.")
+                return
         if self.annotation_scan_worker and self.annotation_scan_worker.isRunning():
             self.annotation_scan_worker.stop()
             if not self.annotation_scan_worker.wait(5000):

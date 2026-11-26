@@ -82,3 +82,14 @@ The Teacher Labeling tab supports folders of ordinary images, including AVIS Eng
 4. Teacher masks and the annotation manifest are written next to the AVIS images under labels_yolopv2/AVIS/. The original images and manifest.jsonl are not modified.
 
 Open the same AVIS capture folder as a source root in the main RoadForge app, rescan, validate the four-class image/mask pairs, then prepare the train/validation/test split. See docs/TRAINING.md for fine-tuning an existing semantic checkpoint and the warning used when all frames belong to one AVIS session.
+
+## Reversible vehicle-to-background post-processing
+
+After annotation, select the relevant AVIS or CARLA scopes in the image tree and use
+Vehicles → Background (3 → 0) to change all class-3 pixels in the active combined
+training masks to class 0. The original combined masks remain unchanged and are recorded
+in annotation_manifest.json; Restore original vehicle labels switches the manifest
+back to those originals. The drivable, lane, and binary vehicle source masks are retained.
+Only successfully annotated and checked images are processed. This does not change the
+four-class model architecture; it changes the semantic target labels supplied for training.
+
