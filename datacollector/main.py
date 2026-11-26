@@ -401,6 +401,7 @@ class MainWindow(QMainWindow):
     def _annotation_scan_finished(self, worker):
         if self.annotation_scan_worker is worker:
             self.annotation_scan_worker = None
+        self._update_mask_postprocess_buttons()
 
     def _finish_annotation_scan_ui(self):
         self.rescan_btn.setEnabled(True)
