@@ -302,6 +302,66 @@ def test_avis_collector_annotations_inside_images_subfolder_are_discovered_from_
     assert not [issue for issue in report.issues if issue.severity == "error"]
 
 
+def test_avis_parent_manifest_is_discovered_when_images_folder_is_selected(tmp_path):
+    capture_root = tmp_path / "AVIS_RoadForge_Captures"
+    _write_avis_capture_set(capture_root, count=2)
+    image_root = capture_root / "images"
+
+    # Teacher Source was the capture root, so the Collector wrote the manifest
+    # and masks beside images/, while Dataset Manager was pointed directly at
+    # images/. This was the missing inverse of the nested-manifest case.
+    annotation_entries = {}
+    for index in range(2):
+        filename = f"avis_{index:04d}.jpg"
+        image_rel = f"images/{filename}"
+        mask_path = capture_root / "labels_yolopv2" / "AVIS" / "combined_4class_no_vehicles" / f"avis_{index:04d}.png"
+        mask_path.parent.mkdir(parents=True, exist_ok=True)
+        mask = np.tile(np.array([[0, 1, 2, 0]], dtype=np.uint8), (12, 4))
+        Image.fromarray(mask, mode="L").save(mask_path)
+        annotation_entries[image_rel] = {
+            "status": "success",
+            "original_image": image_rel,
+            "combined_mask": (
+                f"labels_yolopv2/AVIS/combined_4class_no_vehicles/{filename[:-4]}.png"
+            ),
+            "original_combined_mask": (
+                f"labels_yolopv2/AVIS/combined_4class/{filename[:-4]}.png"
+            ),
+            "postprocessing": {
+                "operation": "map_class_to_background",
+                "source_class_id": 3,
+                "target_class_id": 0,
+            },
+            "class_map": {
+                "0": "background",
+                "1": "ego_drivable_area",
+                "2": "lane_lines",
+                "3": "vehicles",
+            },
+            "num_classes": 4,
+        }
+
+    (capture_root / "annotation_manifest.json").write_text(
+        json.dumps({"format": "yolopv2-annotations-v1", "images": annotation_entries}),
+        encoding="utf-8",
+    )
+
+    collections = discover_collections([image_root])
+    assert len(collections) == 1
+    collection = collections[0]
+    assert collection.image_count == 2
+    assert collection.annotated_count == 2
+    assert collection.missing_mask_count == 0
+    for sample in collection.samples:
+        assert sample.mask is not None
+        assert Path(sample.mask).is_file()
+        assert sample.metadata["_annotation_original_image"] == sample.filename
+
+    report = validate_samples(collection.samples)
+    assert len(report.valid) == 2
+    assert not [issue for issue in report.issues if issue.severity == "error"]
+
+
 def test_avis_collector_annotations_inside_images_subfolder_are_discovered_when_selected_directly(tmp_path):
     capture_root = tmp_path / "AVIS_RoadForge_Captures"
     _write_avis_capture_set(capture_root, count=1)
