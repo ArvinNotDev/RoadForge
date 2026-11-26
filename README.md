@@ -291,9 +291,9 @@ RoadForge also includes a separate **Classification Lab** for AVIS-specific imag
 
 The initial task presets cover obstacle presence (no, yes), safe return to the right lane (no, yes), and traffic signs (no_sign, stop, speed_limit, no_entry, turn_left, give_way). The task count and class vocabulary are editable; these presets are examples, not hard-coded limits.
 
-Each task gets its own classification head on a shared backbone. A one-task dataset trains one head, two tasks train two heads, and three tasks train three heads. All tasks use mutually exclusive per-image classes (including an explicit no_sign class when appropriate). The trained best.pt checkpoint contains the backbone name, class mappings, preprocessing values, and all task heads.
+Each task gets its own classification head on a shared backbone. A one-task dataset trains one head, two tasks train two heads, and three tasks train three heads. All tasks use mutually exclusive per-image classes (including an explicit no_sign class when appropriate). The trained best.pt checkpoint contains the backbone name, class mappings, preprocessing values, and all task heads. Select that checkpoint in **ONNX Export** to generate a multi-output ONNX graph; RoadForge detects AVIS classification checkpoints automatically, preserves the saved 224×224 preprocessing, embeds each task's class order as metadata, and validates PyTorch/ONNX parity for every head.
 
-For the data contract, annotation details, split behavior, and limitations, see [AVIS Classification](docs/CLASSIFICATION.md).
+For the data contract, annotation details, split behavior, ONNX output contract, and limitations, see [AVIS Classification](docs/CLASSIFICATION.md).
 
 
 ### G. Fine-tune the semantic model on AVIS captures
