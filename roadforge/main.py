@@ -150,6 +150,7 @@ class MainWindow(QMainWindow):
         self.active_model = ""
         self.latest_evaluation: dict | None = None
         self.latest_benchmark: dict | None = None
+        self.latest_onnx_task: str | None = None
         self._log_lines: list[str] = []
         self._build_ui()
         self._sync_config_controls()
@@ -567,14 +568,17 @@ class MainWindow(QMainWindow):
 
     def _build_onnx_page(self, layout):
         top = QHBoxLayout()
-        self.onnx_source = QLineEdit(); self.onnx_source.setPlaceholderText("Trained semantic PyTorch checkpoint")
+        self.onnx_source = QLineEdit(); self.onnx_source.setPlaceholderText("Trained .pt checkpoint (YOLO semantic or AVIS classifier)")
         top.addWidget(self.onnx_source, 1); top.addWidget(button("Checkpoint…", lambda: self._choose_file(self.onnx_source, "PyTorch checkpoint (*.pt)")))
         self.onnx_imgsz = QSpinBox(); self.onnx_imgsz.setRange(128, 2048); self.onnx_imgsz.setValue(512); self.onnx_imgsz.setPrefix("Image size "); top.addWidget(self.onnx_imgsz)
         self.onnx_opset = QSpinBox(); self.onnx_opset.setRange(12, 21); self.onnx_opset.setValue(17); self.onnx_opset.setPrefix("Opset "); top.addWidget(self.onnx_opset)
-        self.onnx_dynamic = QCheckBox("Dynamic shapes"); top.addWidget(self.onnx_dynamic)
+        self.onnx_dynamic = QCheckBox("Dynamic batch"); self.onnx_dynamic.setToolTip("For AVIS classifiers, only the batch dimension is dynamic; the trained spatial input size remains fixed."); top.addWidget(self.onnx_dynamic)
         self.onnx_simplify = QCheckBox("Simplify graph"); top.addWidget(self.onnx_simplify)
         top.addWidget(button("Export + validate", self.start_onnx_export, primary=True))
         layout.addLayout(top)
+        export_hint = QLabel("Checkpoint type is detected automatically. AVIS ResNet18 / EfficientNet-B0 checkpoints export one logits output per task and use their saved input size and normalization (normally 224×224).")
+        export_hint.setObjectName("Muted"); export_hint.setWordWrap(True)
+        layout.addWidget(export_hint)
         comparison = QHBoxLayout()
         self.onnx_path = QLineEdit(); self.onnx_path.setPlaceholderText("Exported ONNX file")
         comparison.addWidget(self.onnx_path, 1); comparison.addWidget(button("Compare…", self.choose_onnx_for_compare)); comparison.addWidget(button("PyTorch / ONNX parity…", self.start_parity)); comparison.addWidget(button("Benchmark…", self.start_benchmark)); comparison.addWidget(button("Deployment package…", self.start_deployment))
@@ -1503,18 +1507,42 @@ class MainWindow(QMainWindow):
         source = self.onnx_source.text().strip()
         if not source:
             QMessageBox.warning(self, "Checkpoint required", "Select a trained .pt semantic checkpoint first."); return
-        if QMessageBox.question(self, "Export ONNX", f"Export and validate ONNX from:\n{source}\n\nImage size: {self.onnx_imgsz.value()} · Opset: {self.onnx_opset.value()}") != QMessageBox.StandardButton.Yes:
+        if QMessageBox.question(
+            self, "Export ONNX",
+            f"Export and validate ONNX from:\n{source}\n\n"
+            f"Semantic models use image size {self.onnx_imgsz.value()}; AVIS classification models use the input size and normalization saved in their checkpoint.\n"
+            f"Opset: {self.onnx_opset.value()}"
+        ) != QMessageBox.StandardButton.Yes:
             return
         output_root = Path(self.config.get("workspace", APP_DIR)) / "exports"
         self._start_operation("ONNX export", export_onnx, source, self.onnx_imgsz.value(), self.onnx_opset.value(), self.onnx_dynamic.isChecked(), self.onnx_simplify.isChecked(), output_root, on_done=self._onnx_export_done)
 
     def _onnx_export_done(self, result):
+        self.latest_onnx_task = result.get("task", "semantic")
         self.onnx_path.setText(result["path"])
-        self.test_model.setText(result["path"])
-        self.onnx_status.setText(f"Export validated · {result['onnx_checker']} · {result['size_bytes']:,} bytes · providers={result['providers']}")
+        if self.latest_onnx_task == "semantic":
+            self.test_model.setText(result["path"])
+            detail = f"semantic · {result.get('input_shape_used', ['?', '?', '?', '?'])[-1]} px"
+        else:
+            detail = (
+                f"AVIS classification · {result.get('backbone', 'unknown')} · "
+                f"{result.get('input_size', '?')}×{result.get('input_size', '?')} · "
+                f"{len(result.get('task_outputs', []))} task head(s) · PyTorch/ONNX parity passed"
+            )
+        self.onnx_status.setText(f"Export validated · {detail} · {result['size_bytes']:,} bytes · providers={result['providers']}")
         self.onnx_log.setPlainText(json.dumps(result, indent=2))
         try:
-            self._register_model_artifact(result["path"], {"source": "onnx_export", "from_checkpoint": self.onnx_source.text().strip(), "imgsz": self.onnx_imgsz.value()})
+            self._register_model_artifact(
+                result["path"],
+                {
+                    "source": "onnx_export",
+                    "from_checkpoint": self.onnx_source.text().strip(),
+                    "task": self.latest_onnx_task,
+                    "backbone": result.get("backbone"),
+                    "input_size": result.get("input_size", self.onnx_imgsz.value()),
+                    "task_outputs": result.get("task_outputs"),
+                },
+            )
         except Exception as exc:
             self._append_log(f"ERROR · model library registration failed: {exc}")
 
@@ -1522,6 +1550,13 @@ class MainWindow(QMainWindow):
         self._choose_file(self.onnx_path, "ONNX (*.onnx)")
 
     def start_parity(self):
+        if self.latest_onnx_task == "classification":
+            QMessageBox.information(
+                self, "AVIS classification parity",
+                "The AVIS export already runs PyTorch-versus-ONNX numerical parity for every task head. "
+                "The separate comparison viewer on this page is currently for semantic-segmentation models."
+            )
+            return
         pt, onnx = self.onnx_source.text().strip(), self.onnx_path.text().strip()
         if not pt or not onnx:
             QMessageBox.warning(self, "Parity inputs", "Choose both the PyTorch checkpoint and exported ONNX model."); return
@@ -1530,6 +1565,13 @@ class MainWindow(QMainWindow):
             self._start_operation("PyTorch / ONNX comparison", compare_models, pt, onnx, image, self.onnx_imgsz.value(), "auto", on_done=lambda result: self.onnx_log.setPlainText(json.dumps(result, indent=2)))
 
     def start_benchmark(self):
+        if self.latest_onnx_task == "classification":
+            QMessageBox.information(
+                self, "AVIS classification benchmark",
+                "The current benchmark action uses the semantic-segmentation inference engine. "
+                "The AVIS ONNX export has already passed an ONNX Runtime smoke test and per-head parity check."
+            )
+            return
         model = self.onnx_path.text().strip() or self.onnx_source.text().strip()
         if not model:
             QMessageBox.warning(self, "Model required", "Choose a PyTorch or ONNX model."); return
@@ -1547,6 +1589,13 @@ class MainWindow(QMainWindow):
         self._append_log(f"Benchmark report saved: {path}")
 
     def start_deployment(self):
+        if self.latest_onnx_task == "classification":
+            QMessageBox.information(
+                self, "AVIS classification deployment",
+                "The existing deployment package is specific to semantic segmentation masks. "
+                "Use the exported AVIS ONNX graph and its embedded task/preprocessing metadata in AVIS Engine."
+            )
+            return
         model = self.onnx_path.text().strip()
         if not model:
             QMessageBox.warning(self, "ONNX model required", "Export and validate a semantic ONNX model before creating a deployment package."); return
