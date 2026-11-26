@@ -782,6 +782,7 @@ def _export_avis_classifier_onnx(
                 input_names=["images"],
                 output_names=output_names,
                 dynamic_axes=dynamic_axes,
+                dynamo=False,  # Keep dynamic_axes semantics stable across newer PyTorch defaults.
             )
 
             graph = onnx.load(str(graph_path))
