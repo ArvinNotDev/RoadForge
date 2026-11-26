@@ -31,14 +31,18 @@ def register_model(workspace: str | Path, model_path: str | Path, details: dict 
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     models = list_models(workspace)
+    artifact_details = details or {}
+    task = str(artifact_details.get("task", "semantic")).strip().lower()
+    if task not in {"semantic", "classification"}:
+        task = "semantic"
     entry = {
         "name": source.stem,
         "path": str(source),
         "format": source.suffix.lower().lstrip("."),
-        "task": "semantic",
+        "task": task,
         "sha256": digest.hexdigest(),
         "registered_at": datetime.now().astimezone().isoformat(),
-        "details": details or {},
+        "details": artifact_details,
     }
     match = next((i for i, item in enumerate(models) if item.get("sha256") == entry["sha256"] or item.get("path") == entry["path"]), None)
     if match is None:
