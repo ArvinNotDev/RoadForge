@@ -171,11 +171,11 @@ def discover_collections(dataset_roots: Iterable[str | Path]) -> list[Collection
                         annotation_entries_by_root[annotation_root] = {}
                 except (OSError, json.JSONDecodeError):
                     annotation_entries_by_root[annotation_root] = {}
-            annotation_entries = dict(annotation_entries_by_root.get(collection, {}))
+            annotation_entries = dict(annotation_entries_by_root.get(collection.resolve(), {}))
             if not is_carla and generic_image_dir != collection:
                 # Keep the parent-root entries authoritative; the nested layout
                 # normally uses bare filenames as keys (e.g. frame.jpg).
-                for key, value in annotation_entries_by_root.get(generic_image_dir, {}).items():
+                for key, value in annotation_entries_by_root.get(generic_image_dir.resolve(), {}).items():
                     annotation_entries.setdefault(key, value)
 
             metadata_by_path: dict[str, dict] = {}
@@ -250,7 +250,7 @@ def discover_collections(dataset_roots: Iterable[str | Path]) -> list[Collection
                     # as well as manifests written directly inside images/.
                     for candidate_root in annotation_roots:
                         try:
-                            relative_image = image.relative_to(candidate_root).as_posix()
+                            relative_image = image.resolve().relative_to(candidate_root).as_posix()
                         except ValueError:
                             continue
                         candidate_keys = [relative_image]
@@ -273,7 +273,7 @@ def discover_collections(dataset_roots: Iterable[str | Path]) -> list[Collection
                     mask_path = _safe_manifest_path(annotation_root, str(combined)) if combined else None
                     if mask_path and mask_path.is_file():
                         mask = str(mask_path)
-                    elif combined and annotation_root != collection:
+                    elif combined and annotation_root != collection.resolve():
                         # Accommodate manifests whose mask path was written
                         # relative to the capture root rather than images/.
                         alternate_mask_path = _safe_manifest_path(collection, str(combined))
@@ -310,7 +310,7 @@ def discover_collections(dataset_roots: Iterable[str | Path]) -> list[Collection
                             # images/frame.jpg to the selected images/ folder's
                             # local frame.jpg path.
                             try:
-                                annotation_relative_image = image.relative_to(annotation_root).as_posix()
+                                annotation_relative_image = image.resolve().relative_to(annotation_root).as_posix()
                             except ValueError:
                                 annotation_relative_image = rel
                             if declared_image in {
