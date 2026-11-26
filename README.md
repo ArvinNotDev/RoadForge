@@ -54,7 +54,7 @@ flowchart LR
 | **Dataset management** | Collection discovery, metadata filters, image/mask pairing, manifest-aware label selection, non-destructive preparation, optional quality-aware downsampling with town/session and rare-class coverage |
 | **Quality assurance** | Decode and dimension checks, class-ID validation, empty-mask warnings, duplicate filename detection, SHA-256 duplicate-frame detection, complete JSON audit report |
 | **Leakage-aware splitting** | Collection-session grouping, exact-duplicate group linking, seeded train/validation/test assignment, optional held-out-town evaluation |
-| **Model training** | YOLO26 semantic model scales (`n`, `s`, `m`, `l`, `x`), pretrained checkpoint fine-tuning, architecture-only initialization, pause/stop at checkpoint boundaries, resume support |
+| **Model training** | YOLO26 semantic model scales (`n`, `s`, `m`, `l`, `x`), pretrained checkpoint fine-tuning, architecture-only initialization, pause/stop at checkpoint boundaries, resume support; AVIS image-level multi-task classification with ResNet18 or EfficientNet-B0 |
 | **Experiment tracking** | Versioned training configurations, per-run snapshots, logs, metrics, split manifests, run metadata, and local model registry |
 | **Evaluation** | Per-class IoU, precision, recall, Dice, pixel accuracy, mean pixel accuracy, mIoU, foreground mIoU, confusion matrix, CSV/JSON reports |
 | **Inference & deployment** | Image, folder, video, and webcam inference; ONNX export and graph validation; PyTorch/ONNX parity; warmed-up benchmark; deployment package |
@@ -276,6 +276,24 @@ By default, application-generated files are stored under `roadforge/workspace/` 
 | Benchmark reports | `workspace/benchmarks/` |
 | Evaluation reports | `<prepared_dataset>/evaluations/` |
 | Deployment bundles | User-selected output directory |
+
+
+### F. Build an AVIS classification dataset
+
+RoadForge also includes a separate **Classification Lab** for AVIS-specific image-level tasks. It does not change the existing four-class semantic-segmentation pipeline.
+
+1. Run AVIS Engine and open its live browser dashboard.
+2. Use **Capture frame for RoadForge** while driving. AVIS stores the current front-camera frame and telemetry in the Documents/AVIS_RoadForge_Captures folder (images under images/, metadata in manifest.jsonl). Each AVIS process uses a session ID.
+3. Open **Classification Lab** in RoadForge. Create a dataset, define one, two, or three tasks, and enter the class names for each task as comma-separated values.
+4. Import the AVIS capture folder. RoadForge copies images into the dataset and skips byte-identical duplicates.
+5. Annotate images sequentially. Select exactly one class for every configured task, then choose **Save Labels & Next**.
+6. Choose **ResNet18** or **EfficientNet-B0**, keep ImageNet pretrained initialization enabled for a small dataset, and start training.
+
+The initial task presets cover obstacle presence (no, yes), safe return to the right lane (no, yes), and traffic signs (no_sign, stop, speed_limit, no_entry, turn_left, give_way). The task count and class vocabulary are editable; these presets are examples, not hard-coded limits.
+
+Each task gets its own classification head on a shared backbone. A one-task dataset trains one head, two tasks train two heads, and three tasks train three heads. All tasks use mutually exclusive per-image classes (including an explicit no_sign class when appropriate). The trained best.pt checkpoint contains the backbone name, class mappings, preprocessing values, and all task heads.
+
+For the data contract, annotation details, split behavior, and limitations, see [AVIS Classification](docs/CLASSIFICATION.md).
 
 ## Current limitations and scientific cautions
 

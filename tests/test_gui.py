@@ -17,8 +17,10 @@ def test_main_window_loads_all_sections_and_controls(tmp_path, monkeypatch):
     monkeypatch.setattr(app_module, "PROJECT_ROOT", tmp_path)
     app = QApplication.instance() or QApplication([])
     window = MainWindow()
-    assert window.stack.count() == 10
+    assert window.stack.count() == 11
     assert window.PAGES[0] == "Dashboard"
+    assert window.PAGES[9] == "Classification Lab"
+    assert hasattr(window, "classification_page")
     assert window.model_name.text() == "YOLO26l-sem · semantic"
     assert all(edit.isReadOnly() for edit in window.class_names)
     assert [edit.text() for edit in window.class_names] == ["background", "ego_drivable_area", "lane_lines", "vehicles"]

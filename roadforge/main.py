@@ -29,6 +29,7 @@ from .core.runtime import (
 )
 from .core.splits import prepare_dataset
 from .core.workers import DatasetScanWorker, OperationWorker, TrainingWorker, ValidationWorker
+from .classification import ClassificationPage
 
 
 APP_DIR = Path(__file__).resolve().parents[1]
@@ -107,7 +108,7 @@ class MetricCard(QFrame):
 
 
 class MainWindow(QMainWindow):
-    PAGES = ["Dashboard", "Dataset Manager", "Dataset Quality & Splits", "Model & Training", "Experiments", "Evaluation", "Model Testing", "ONNX Export", "Settings", "Logs & Diagnostics"]
+    PAGES = ["Dashboard", "Dataset Manager", "Dataset Quality & Splits", "Model & Training", "Experiments", "Evaluation", "Model Testing", "ONNX Export", "Settings", "Classification Lab", "Logs & Diagnostics"]
 
     def __init__(self):
         super().__init__()
@@ -198,6 +199,9 @@ class MainWindow(QMainWindow):
         self.addAction(exit_action)
 
     def _page(self, index: int) -> QWidget:
+        if index == 9:
+            self.classification_page = ClassificationPage(Path(self.config.get("workspace", APP_DIR)), self)
+            return self.classification_page
         page = QWidget()
         outer = QVBoxLayout(page)
         outer.setContentsMargins(26, 22, 26, 22)
@@ -1541,6 +1545,10 @@ class MainWindow(QMainWindow):
         if path: Path(path).write_text("\n".join(self._log_lines), encoding="utf-8")
 
     def closeEvent(self, event):
+        classification_page = getattr(self, "classification_page", None)
+        if classification_page is not None and classification_page.is_training():
+            QMessageBox.warning(self, "Classification training active", "Wait for classification training to finish before closing RoadForge.")
+            event.ignore(); return
         if self.webcam_worker and self.webcam_worker.isRunning():
             self.webcam_worker.request_stop()
             self.webcam_worker.wait(3000)

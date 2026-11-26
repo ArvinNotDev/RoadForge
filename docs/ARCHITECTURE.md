@@ -64,3 +64,14 @@ Long-running tasks execute in worker threads so the Qt event loop remains respon
 - Training run directories are unique. Configurations, split manifests, logs, metrics, and run metadata are saved with each run.
 - Model registry removal deletes only a registry entry; it does not delete the referenced model file.
 - ONNX export uses a temporary checkpoint copy and validates the resulting graph before reporting success.
+
+
+## AVIS multi-task image classification (roadforge/classification_*.py)
+
+The Classification Lab is a separate image-level workflow that shares no label IDs or training runtime with the existing Ultralytics semantic-segmentation path.
+
+- classification_data.py validates one to three task schemas, imports the AVIS capture manifest, deduplicates exact image bytes, persists per-image labels, and creates session-aware train/validation/test partitions.
+- classification.py provides the PySide6 sequential annotation and training interface.
+- classification_training.py builds a shared ResNet18 or EfficientNet-B0 feature extractor with one independent linear classification head per task, performs transfer learning, and writes self-describing PyTorch checkpoints.
+
+AVIS Engine's browser dashboard saves the latest front-camera JPEG into Documents/AVIS_RoadForge_Captures. The capture manifest records a per-runtime session ID and available telemetry. RoadForge imports these files from disk, so the two applications do not need a network bridge or to run simultaneously.

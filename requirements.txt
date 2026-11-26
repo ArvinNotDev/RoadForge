@@ -8,3 +8,5 @@ onnxruntime>=1.17,<2
 opencv-python-headless>=4.9,<5
 # Keep the client API aligned with the CARLA 1.0 simulator used for data collection.
 carla==1.0
+
+torchvision>=0.18,<1
