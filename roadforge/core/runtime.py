@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import sys
 import time
@@ -659,6 +660,233 @@ def _smoke_test_onnx(session, imgsz: int, expected_classes: int | None = None) -
     return {"input_shape_used": list(shape), "output_shape": list(raw.shape), "smoke_test": "passed", "classes_observed_on_zero_input": class_ids}
 
 
+
+def _read_avis_classifier_checkpoint(path: str | Path) -> dict | None:
+    """Safely identify RoadForge's self-describing AVIS classification checkpoints."""
+    import torch
+
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception:
+        # Ultralytics checkpoints may contain serialized model classes and are
+        # handled by the existing Ultralytics exporter below.
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if not (
+        isinstance(payload.get("backbone"), str)
+        and isinstance(payload.get("tasks"), list)
+        and isinstance(payload.get("state_dict"), dict)
+    ):
+        return None
+    return payload
+
+
+def _export_avis_classifier_onnx(
+    source: Path,
+    payload: dict,
+    opset: int = 17,
+    dynamic: bool = False,
+    simplify: bool = False,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """Export a RoadForge AVIS multi-head image classifier to a validated ONNX graph."""
+    import tempfile
+
+    import onnx
+    import onnxruntime as ort
+    import torch
+    import torch.nn as nn
+
+    from ..classification_training import build_multitask_classifier
+
+    backbone = str(payload["backbone"]).strip().lower()
+    tasks = payload["tasks"]
+    if backbone not in {"resnet18", "efficientnet_b0"}:
+        raise ValueError(f"Unsupported AVIS classification backbone in checkpoint: {backbone!r}.")
+    if not tasks:
+        raise ValueError("AVIS classification checkpoint contains no task heads.")
+
+    input_size = int(payload.get("input_size", 224))
+    if input_size < 32 or input_size > 4096:
+        raise ValueError(f"Invalid classification input_size in checkpoint: {input_size}.")
+
+    mean = [float(value) for value in payload.get("mean", (0.485, 0.456, 0.406))]
+    std = [float(value) for value in payload.get("std", (0.229, 0.224, 0.225))]
+    if len(mean) != 3 or len(std) != 3 or not np.all(np.isfinite(mean + std)) or any(value <= 0 for value in std):
+        raise ValueError("Classification checkpoint must contain three finite RGB normalization means and positive standard deviations.")
+
+    task_outputs = []
+    output_names = []
+    used_names = set()
+    normalized_tasks = []
+    for index, task in enumerate(tasks):
+        if not isinstance(task, dict):
+            raise ValueError(f"Invalid task schema at index {index}.")
+        key = str(task.get("key", "")).strip()
+        name = str(task.get("name", key or f"Task {index + 1}")).strip()
+        classes = task.get("classes")
+        if not key or not isinstance(classes, list) or len(classes) < 2:
+            raise ValueError(f"Task {index + 1} must declare a non-empty key and at least two classes.")
+        classes = [str(value).strip() for value in classes]
+        if any(not value for value in classes) or len(set(classes)) != len(classes):
+            raise ValueError(f"Task {key!r} contains empty or duplicate class names.")
+        safe_key = re.sub(r"[^A-Za-z0-9_]+", "_", key).strip("_") or f"task_{index}"
+        output_name = f"logits_{safe_key}"
+        if output_name in used_names:
+            output_name = f"{output_name}_{index}"
+        used_names.add(output_name)
+        output_names.append(output_name)
+        normalized = {"key": key, "name": name, "classes": classes}
+        normalized_tasks.append(normalized)
+        task_outputs.append({**normalized, "output_name": output_name, "output_index": index})
+
+    output_root = Path(output_dir).expanduser().resolve() if output_dir else source.parent / "exports"
+    output_root.mkdir(parents=True, exist_ok=True)
+    target = output_root / (
+        f"{source.stem}_avis_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{uuid.uuid4().hex[:5]}.onnx"
+    )
+
+    model = build_multitask_classifier(backbone, normalized_tasks, pretrained=False)
+    model.load_state_dict(payload["state_dict"], strict=True)
+    model.eval().cpu()
+
+    class ONNXExportWrapper(nn.Module):
+        def __init__(self, classifier):
+            super().__init__()
+            self.classifier = classifier
+
+        def forward(self, images):
+            return tuple(self.classifier(images))
+
+    wrapper = ONNXExportWrapper(model).eval()
+    dummy = torch.linspace(
+        -1.0, 1.0, steps=3 * input_size * input_size, dtype=torch.float32
+    ).reshape(1, 3, input_size, input_size)
+    dynamic_axes = None
+    if dynamic:
+        # The model is trained at a fixed spatial resolution. Only batch is dynamic.
+        dynamic_axes = {"images": {0: "batch"}}
+        dynamic_axes.update({name: {0: "batch"} for name in output_names})
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="roadforge_avis_export_", dir=output_root) as temp_root:
+            graph_path = Path(temp_root) / "classification.onnx"
+            torch.onnx.export(
+                wrapper,
+                dummy,
+                str(graph_path),
+                export_params=True,
+                opset_version=int(opset),
+                do_constant_folding=True,
+                input_names=["images"],
+                output_names=output_names,
+                dynamic_axes=dynamic_axes,
+            )
+
+            graph = onnx.load(str(graph_path))
+            if simplify:
+                try:
+                    from onnxsim import simplify as simplify_onnx
+                except ImportError as exc:
+                    raise RuntimeError(
+                        "Graph simplification for AVIS classifiers requires onnxsim. "
+                        "Install it with 'pip install onnxsim', or uncheck Simplify graph."
+                    ) from exc
+                graph, is_valid = simplify_onnx(graph)
+                if not is_valid:
+                    raise RuntimeError("onnxsim reported that the simplified AVIS graph is not equivalent.")
+            metadata = {
+                "task": "classification",
+                "task_type": "classification",
+                "roadforge_format": "avis_multitask_classification_v1",
+                "backbone": backbone,
+                "input_size": str(input_size),
+                "input_layout": "NCHW",
+                "input_dtype": "float32",
+                "color_order": "RGB",
+                "pixel_range_before_normalization": "[0, 1]",
+                "normalization_mean": json.dumps(mean, ensure_ascii=False),
+                "normalization_std": json.dumps(std, ensure_ascii=False),
+                "resize": f"Direct RGB resize to {input_size}x{input_size}; no letterbox; bilinear interpolation.",
+                "output_format": "Raw per-task logits. Apply softmax per output for probabilities; argmax selects the class index.",
+                "tasks": json.dumps(task_outputs, ensure_ascii=False),
+            }
+            onnx.helper.set_model_props(graph, metadata)
+            onnx.checker.check_model(graph)
+            onnx.save(graph, str(graph_path))
+
+            session = ort.InferenceSession(str(graph_path), providers=["CPUExecutionProvider"])
+            inputs = session.get_inputs()
+            outputs = session.get_outputs()
+            if len(inputs) != 1 or len(outputs) != len(task_outputs):
+                raise RuntimeError(
+                    f"Expected one image input and {len(task_outputs)} task outputs; "
+                    f"got {len(inputs)} input(s) and {len(outputs)} output(s)."
+                )
+            if inputs[0].name != "images":
+                raise RuntimeError(f"Unexpected ONNX input name: {inputs[0].name!r}.")
+            if [item.name for item in outputs] != output_names:
+                raise RuntimeError("ONNX graph output names/order do not match the checkpoint task schema.")
+
+            with torch.inference_mode():
+                torch_outputs = wrapper(dummy)
+            ort_outputs = session.run(output_names, {"images": dummy.numpy()})
+            parity_rows = []
+            for task_output, expected_tensor, actual_value, output_meta in zip(
+                task_outputs, torch_outputs, ort_outputs, outputs
+            ):
+                expected = expected_tensor.detach().cpu().numpy()
+                actual = np.asarray(actual_value)
+                expected_shape = (1, len(task_output["classes"]))
+                if actual.shape != expected_shape or tuple(expected.shape) != expected_shape:
+                    raise RuntimeError(
+                        f"Task {task_output['key']!r} output has an unexpected shape: "
+                        f"PyTorch={expected.shape}, ONNX={actual.shape}, expected={expected_shape}."
+                    )
+                if not np.all(np.isfinite(actual)):
+                    raise RuntimeError(f"ONNX output for task {task_output['key']!r} contains NaN or infinity.")
+                max_abs_diff = float(np.max(np.abs(expected - actual)))
+                parity_passed = bool(np.allclose(expected, actual, rtol=1e-3, atol=1e-4))
+                parity_rows.append({
+                    "task": task_output["key"],
+                    "output_name": output_meta.name,
+                    "shape": list(actual.shape),
+                    "max_absolute_difference": max_abs_diff,
+                    "allclose": parity_passed,
+                })
+                if not parity_passed:
+                    raise RuntimeError(
+                        f"PyTorch/ONNX parity failed for task {task_output['key']!r} "
+                        f"(maximum absolute difference {max_abs_diff:.6g})."
+                    )
+
+            onnx.checker.check_model(onnx.load(str(graph_path)))
+            os.replace(graph_path, target)
+
+        return {
+            "path": str(target.resolve()),
+            "size_bytes": target.stat().st_size,
+            "task": "classification",
+            "backbone": backbone,
+            "input_size": input_size,
+            "input_shape_used": [1, 3, input_size, input_size],
+            "dynamic_batch": bool(dynamic),
+            "dynamic_spatial": False,
+            "simplified": bool(simplify),
+            "task_outputs": task_outputs,
+            "inputs": [{"name": item.name, "shape": item.shape, "type": item.type} for item in inputs],
+            "outputs": [{"name": item.name, "shape": item.shape, "type": item.type} for item in outputs],
+            "providers": session.get_providers(),
+            "onnx_checker": "passed",
+            "smoke_test": "passed",
+            "pytorch_onnx_parity": parity_rows,
+            "metadata": metadata,
+        }
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
+
 def export_onnx(checkpoint: str, imgsz: int = 512, opset: int = 17, dynamic: bool = False, simplify: bool = False, output_dir: str | Path | None = None) -> dict:
     import tempfile
     source = Path(checkpoint).expanduser().resolve()
@@ -668,6 +896,15 @@ def export_onnx(checkpoint: str, imgsz: int = 512, opset: int = 17, dynamic: boo
         raise ValueError("ONNX export requires a local PyTorch .pt checkpoint.")
     if imgsz < 32 or opset < 12:
         raise ValueError("Image size must be at least 32 and ONNX opset must be 12 or newer.")
+
+    # AVIS Classification Lab checkpoints are self-describing PyTorch state dictionaries.
+    # Route them to the native Torch exporter; the existing Ultralytics semantic path stays intact.
+    avis_payload = _read_avis_classifier_checkpoint(source)
+    if avis_payload is not None:
+        return _export_avis_classifier_onnx(
+            source, avis_payload, opset=opset, dynamic=dynamic,
+            simplify=simplify, output_dir=output_dir,
+        )
 
     output_root = Path(output_dir).expanduser().resolve() if output_dir else source.parent / "exports"
     output_root.mkdir(parents=True, exist_ok=True)
