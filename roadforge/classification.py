@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 from .classification_data import (
     DEFAULT_CAPTURE_ROOT,
     DEFAULT_TASKS,
+    analyze_classification_split,
     annotated_samples,
     ensure_dataset,
     import_avis_captures,
@@ -235,6 +236,10 @@ class ClassificationPage(QWidget):
         self.training_status.setObjectName("Muted")
         self.training_status.setWordWrap(True)
         training_layout.addWidget(self.training_status, 4, 0, 1, 4)
+        self.preview_split_button = self._button(
+            "Preview train / validation / test split", self.preview_training_split
+        )
+        training_layout.addWidget(self.preview_split_button, 5, 0, 1, 4)
         layout.addWidget(training_box)
 
         self.log = QPlainTextEdit()
@@ -528,6 +533,56 @@ class ClassificationPage(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, "Could not save annotation", str(exc))
 
+    def preview_training_split(self):
+        root = Path(self.dataset_edit.text()).expanduser()
+        if not (root / "dataset.json").is_file():
+            QMessageBox.warning(self, "Dataset required", "Create or open a classification dataset first.")
+            return
+        try:
+            rows = annotated_samples(root)
+            tasks = load_dataset_config(root)["tasks"]
+            if len(rows) < 3:
+                raise ValueError(
+                    f"Only {len(rows)} fully annotated images are available. Annotate more images first."
+                )
+            _split, audit = analyze_classification_split(rows, tasks, seed=42)
+            lines = [
+                f"Strategy: {audit['strategy']}",
+                f"Annotated images: {len(rows)}",
+                f"Excluded near split boundaries: {audit['excluded_near_boundaries']}",
+                "",
+            ]
+            for part in ("train", "val", "test"):
+                ratio = audit["actual_ratios"][part]
+                sessions = len(audit["session_distribution"][part])
+                lines.append(
+                    f"{part.upper()}: {audit['counts'][part]} images ({ratio:.1%}), "
+                    f"{sessions} session group(s)"
+                )
+                for task in tasks:
+                    counts = audit["class_distribution"][part][task["key"]]
+                    lines.append(
+                        f"  {task['name']}: "
+                        + ", ".join(f"{name}={count}" for name, count in counts.items())
+                    )
+            if audit["errors"]:
+                lines.extend(["", "BLOCKERS:"] + [f"• {item}" for item in audit["errors"]])
+            if audit["warnings"]:
+                lines.extend(["", "WARNINGS:"] + [f"• {item}" for item in audit["warnings"]])
+            message = "\n".join(lines)
+            self._append_log("SPLIT PREVIEW\n" + message)
+            if audit["errors"]:
+                self.training_status.setText("Dataset split has blockers. Review the classification log.")
+                QMessageBox.warning(self, "Split is not ready for training", message)
+            else:
+                self.training_status.setText(
+                    f"Split preview ready · {audit['strategy']} · "
+                    f"{audit['counts']['train']}/{audit['counts']['val']}/{audit['counts']['test']} samples"
+                )
+                QMessageBox.information(self, "Classification split preview", message)
+        except Exception as exc:
+            QMessageBox.warning(self, "Could not preview split", str(exc))
+
     def start_training(self):
         if self.worker is not None and self.worker.isRunning():
             return
@@ -536,15 +591,25 @@ class ClassificationPage(QWidget):
             QMessageBox.warning(self, "Dataset required", "Create or open a classification dataset first.")
             return
         try:
-            count = len(annotated_samples(root))
-            if count < 3:
-                raise ValueError(f"Only {count} images have labels for every task. Annotate at least three.")
+            rows = annotated_samples(root)
+            if len(rows) < 3:
+                raise ValueError(
+                    f"Only {len(rows)} images have labels for every task. Annotate more images first."
+                )
+            tasks = load_dataset_config(root)["tasks"]
+            _split, audit = analyze_classification_split(rows, tasks, seed=42)
+            if audit["errors"]:
+                raise ValueError("\n".join(audit["errors"]))
         except Exception as exc:
             QMessageBox.warning(self, "Dataset is not ready", str(exc))
             return
 
         self.dataset_root = root.resolve()
+        self._append_log("TRAINING SPLIT AUDIT\n" + json.dumps(audit, indent=2, ensure_ascii=False))
+        for warning in audit["warnings"]:
+            self._append_log("SPLIT WARNING · " + warning)
         self.train_button.setEnabled(False)
+        self.preview_split_button.setEnabled(False)
         self.training_progress.setValue(0)
         self.training_status.setText("Initializing model and loading pretrained weights…")
         self.worker = ClassificationTrainingWorker(
@@ -573,9 +638,12 @@ class ClassificationPage(QWidget):
             epoch = int(payload.get("epoch", 0))
             self.training_progress.setValue(min(100, int(epoch * 100 / epochs)))
             accuracies = payload.get("validation_accuracy", {})
+            macro_f1 = payload.get("validation_macro_f1", {})
             self.training_status.setText(
                 f"Epoch {epoch}/{epochs} · train loss {payload.get('train_loss', 0):.4f} · "
-                f"validation accuracy " + ", ".join(
+                f"validation macro-F1 " + ", ".join(
+                    f"{key}: {value:.1%}" for key, value in macro_f1.items()
+                ) + " · accuracy " + ", ".join(
                     f"{key}: {value:.1%}" for key, value in accuracies.items()
                 )
             )
@@ -585,16 +653,18 @@ class ClassificationPage(QWidget):
     def _training_completed(self, report: dict[str, Any]):
         self.train_button.setEnabled(True)
         self.training_progress.setValue(100)
+        self.preview_split_button.setEnabled(True)
         self.training_status.setText(
             f"Training complete · best epoch {report['best_epoch']} · "
-            f"mean validation accuracy {report['best_validation_mean_accuracy']:.1%} · "
-            f"test: {report['test_accuracy']} · checkpoint: {report['best_checkpoint']}"
+            f"validation macro-F1 {report['best_validation_macro_f1']:.1%} · "
+            f"test macro-F1: {report['test_macro_f1']} · checkpoint: {report['best_checkpoint']}"
         )
         self._append_log(json.dumps(report, indent=2, ensure_ascii=False))
         self._append_log(f"Best checkpoint: {report['best_checkpoint']}")
 
     def _training_failed(self, details: str):
         self.train_button.setEnabled(True)
+        self.preview_split_button.setEnabled(True)
         self.training_status.setText("Training failed. See the classification log for details.")
         self._append_log("TRAINING ERROR\n" + details)
 
