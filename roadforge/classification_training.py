@@ -7,12 +7,21 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from .classification_data import annotated_samples, load_dataset_config, split_samples
+from .classification_data import (
+    analyze_classification_split,
+    annotated_samples,
+    load_dataset_config,
+)
 
 
 IMAGE_SIZE = 224
 IMAGE_MEAN = (0.485, 0.456, 0.406)
 IMAGE_STD = (0.229, 0.224, 0.225)
+DROPOUT_RATE = 0.30
+LABEL_SMOOTHING = 0.02
+WEIGHT_DECAY = 5e-4
+EARLY_STOPPING_PATIENCE = 8
+OVERFIT_GAP_THRESHOLD = 0.20
 
 
 def build_multitask_classifier(backbone: str, tasks: list[dict[str, Any]], pretrained: bool = True):
@@ -38,12 +47,14 @@ def build_multitask_classifier(backbone: str, tasks: list[dict[str, Any]], pretr
             super().__init__()
             self.backbone_name = selected
             self.feature_extractor = base
+            # Dropout regularizes the shared representation before task-specific heads.
+            self.dropout = nn.Dropout(p=DROPOUT_RATE)
             self.heads = nn.ModuleList(
                 [nn.Linear(feature_dim, len(task["classes"])) for task in tasks]
             )
 
         def forward(self, images):
-            features = self.feature_extractor(images)
+            features = self.dropout(self.feature_extractor(images))
             return [head(features) for head in self.heads]
 
     return MultiTaskClassifier()
@@ -87,28 +98,87 @@ def _make_transforms():
 
     train = transforms.Compose([
         transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
-        # Avoid horizontal flips: they can reverse the meaning of road signs and lane manoeuvres.
+        # Horizontal flips are deliberately excluded: they can change road-sign
+        # meaning and reverse left/right manoeuvre labels.
         transforms.RandomApply(
             [transforms.ColorJitter(brightness=0.18, contrast=0.18, saturation=0.12, hue=0.025)],
             p=0.7,
         ),
+        transforms.RandomApply(
+            [transforms.RandomAffine(degrees=2.0, translate=(0.015, 0.015), scale=(0.97, 1.03))],
+            p=0.35,
+        ),
         transforms.ToTensor(),
         transforms.Normalize(IMAGE_MEAN, IMAGE_STD),
     ])
-    validation = transforms.Compose([
+    evaluation = transforms.Compose([
         transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
         transforms.ToTensor(),
         transforms.Normalize(IMAGE_MEAN, IMAGE_STD),
     ])
-    return train, validation
+    return train, evaluation
+
+
+def _metrics_from_confusions(confusions, tasks):
+    metrics: dict[str, dict[str, Any]] = {}
+    for task, raw_matrix in zip(tasks, confusions):
+        matrix = raw_matrix.to(dtype=__import__("torch").float64)
+        true_support = matrix.sum(dim=1)
+        predicted_support = matrix.sum(dim=0)
+        true_positive = matrix.diag()
+        precision = true_positive / predicted_support.clamp_min(1.0)
+        recall = true_positive / true_support.clamp_min(1.0)
+        denominator = precision + recall
+        f1 = torch.where(denominator > 0, 2.0 * precision * recall / denominator, 0.0)
+        active = true_support > 0
+        macro_f1 = float(f1[active].mean().item()) if bool(active.any()) else 0.0
+        balanced_accuracy = float(recall[active].mean().item()) if bool(active.any()) else 0.0
+        total = float(matrix.sum().item())
+        accuracy = float(true_positive.sum().item() / total) if total else 0.0
+        metrics[task["key"]] = {
+            "accuracy": accuracy,
+            "balanced_accuracy": balanced_accuracy,
+            "macro_f1": macro_f1,
+            "per_class": {
+                class_name: {
+                    "precision": float(precision[index].item()),
+                    "recall": float(recall[index].item()),
+                    "f1": float(f1[index].item()),
+                    "support": int(true_support[index].item()),
+                }
+                for index, class_name in enumerate(task["classes"])
+            },
+            "confusion_matrix": matrix.to(dtype=__import__("torch").int64).tolist(),
+            "unsupported_classes": [
+                class_name
+                for index, class_name in enumerate(task["classes"])
+                if int(true_support[index].item()) == 0
+            ],
+        }
+    return metrics
+
+
+def _update_confusions(confusions, outputs, targets):
+    import torch
+
+    for index, output in enumerate(outputs):
+        classes = int(output.shape[1])
+        predictions = output.detach().argmax(dim=1).to(device="cpu", dtype=torch.long)
+        expected = targets[index].detach().to(device="cpu", dtype=torch.long)
+        encoded = expected * classes + predictions
+        confusions[index] += torch.bincount(
+            encoded, minlength=classes * classes
+        ).reshape(classes, classes)
 
 
 def _evaluate(model, loader, tasks, device):
     import torch
 
     model.eval()
-    correct = [0 for _ in tasks]
-    totals = [0 for _ in tasks]
+    confusions = [
+        torch.zeros((len(task["classes"]), len(task["classes"])), dtype=torch.long)
+        for task in tasks
+    ]
     total_loss = 0.0
     batches = 0
     with torch.no_grad():
@@ -117,19 +187,13 @@ def _evaluate(model, loader, tasks, device):
             targets = [item.to(device, non_blocking=True) for item in targets]
             outputs = model(images)
             losses = [
-                torch.nn.functional.cross_entropy(outputs[i], targets[i])
-                for i in range(len(tasks))
+                torch.nn.functional.cross_entropy(outputs[index], targets[index])
+                for index in range(len(tasks))
             ]
             total_loss += float(torch.stack(losses).mean().item())
             batches += 1
-            for index, output in enumerate(outputs):
-                correct[index] += int((output.argmax(dim=1) == targets[index]).sum().item())
-                totals[index] += int(targets[index].numel())
-    accuracies = {
-        task["key"]: (correct[index] / totals[index] if totals[index] else 0.0)
-        for index, task in enumerate(tasks)
-    }
-    return (total_loss / max(1, batches)), accuracies
+            _update_confusions(confusions, outputs, targets)
+    return (total_loss / max(1, batches)), _metrics_from_confusions(confusions, tasks)
 
 
 def train_multitask_classifier(
@@ -143,6 +207,7 @@ def train_multitask_classifier(
     seed: int = 42,
     progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
+    import numpy as np
     import torch
     from torch.utils.data import DataLoader
 
@@ -153,13 +218,23 @@ def train_multitask_classifier(
     rows = annotated_samples(dataset_root)
     if len(rows) < 3:
         raise ValueError(
-            f"Only {len(rows)} fully annotated images are available. Annotate at least three images; "
-            "more images and multiple capture sessions are strongly recommended."
+            f"Only {len(rows)} fully annotated images are available. Annotate more images; "
+            "at least three are required even for a basic split."
         )
 
-    split, split_warning = split_samples(rows, seed=seed)
-    if not split["train"] or not split["val"] or not split["test"]:
-        raise ValueError("The dataset split produced an empty train, validation or test partition.")
+    split, split_audit = analyze_classification_split(rows, tasks, seed=seed)
+    if split_audit["errors"]:
+        details = "\n".join(f"• {item}" for item in split_audit["errors"])
+        raise ValueError("The classification dataset is not ready for reliable training:\n" + details)
+
+    random.seed(int(seed))
+    np.random.seed(int(seed))
+    torch.manual_seed(int(seed))
+    use_cuda = torch.cuda.is_available()
+    if use_cuda:
+        torch.cuda.manual_seed_all(int(seed))
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
     for row in rows:
         row["_absolute_image"] = str((dataset_root / row["image"]).resolve())
@@ -168,46 +243,53 @@ def train_multitask_classifier(
     train_dataset = _ClassificationImageDataset(split["train"], tasks, train_transform)
     val_dataset = _ClassificationImageDataset(split["val"], tasks, eval_transform)
     test_dataset = _ClassificationImageDataset(split["test"], tasks, eval_transform)
-    use_cuda = torch.cuda.is_available()
-    device = torch.device("cuda" if use_cuda else "cpu")
     generator = torch.Generator()
     generator.manual_seed(int(seed))
+    effective_batch_size = max(1, min(256, int(batch_size)))
     train_loader = DataLoader(
-        train_dataset, batch_size=max(1, int(batch_size)), shuffle=True,
-        num_workers=0, pin_memory=use_cuda, generator=generator,
+        train_dataset,
+        batch_size=effective_batch_size,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=use_cuda,
+        generator=generator,
     )
     val_loader = DataLoader(
-        val_dataset, batch_size=max(1, int(batch_size)), shuffle=False,
-        num_workers=0, pin_memory=use_cuda,
+        val_dataset,
+        batch_size=effective_batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=use_cuda,
     )
     test_loader = DataLoader(
-        test_dataset, batch_size=max(1, int(batch_size)), shuffle=False,
-        num_workers=0, pin_memory=use_cuda,
+        test_dataset,
+        batch_size=effective_batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=use_cuda,
     )
 
-    random.seed(seed)
-    torch.manual_seed(seed)
-    if use_cuda:
-        torch.cuda.manual_seed_all(seed)
-
     selected_backbone = str(backbone).strip().lower()
-    model = build_multitask_classifier(selected_backbone, tasks, pretrained=pretrained).to(device)
+    model = build_multitask_classifier(selected_backbone, tasks, pretrained=pretrained).to(
+        torch.device("cuda" if use_cuda else "cpu")
+    )
+    device = next(model.parameters()).device
+
     task_class_weights = []
-    missing_training_classes: dict[str, list[str]] = {}
+    low_support_warnings = []
     for task in tasks:
         counts = Counter(row["labels"][task["key"]] for row in split["train"])
         total = len(split["train"])
         weights = []
-        missing = []
         for class_name in task["classes"]:
             count = counts.get(class_name, 0)
-            if count == 0:
-                missing.append(class_name)
-                weights.append(0.0)
-            else:
-                weights.append(total / (len(task["classes"]) * count))
-        if missing:
-            missing_training_classes[task["key"]] = missing
+            # Missing training classes are rejected by the split audit. Inverse
+            # frequency weights reduce majority-class dominance without resampling.
+            weights.append(total / (len(task["classes"]) * count) if count else 0.0)
+            if 0 < count < 3:
+                low_support_warnings.append(
+                    f"{task['name']} / {class_name} has only {count} training sample(s)."
+                )
         task_class_weights.append(torch.tensor(weights, dtype=torch.float32, device=device))
 
     optimizer = torch.optim.AdamW(
@@ -215,23 +297,31 @@ def train_multitask_classifier(
             {"params": model.feature_extractor.parameters(), "lr": float(learning_rate)},
             {"params": model.heads.parameters(), "lr": float(learning_rate) * 5.0},
         ],
-        weight_decay=1e-4,
+        weight_decay=WEIGHT_DECAY,
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", factor=0.5, patience=3,
+        optimizer,
+        mode="max",
+        factor=0.5,
+        patience=2,
+        threshold=1e-3,
     )
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     run_dir = workspace / "classification_runs" / f"{dataset_root.name}_{selected_backbone}_{timestamp}"
     run_dir.mkdir(parents=True, exist_ok=False)
     effective_epochs = max(1, min(500, int(epochs)))
-    patience = 7
     best_score = -1.0
     best_epoch = 0
+    best_record: dict[str, Any] | None = None
     epochs_without_improvement = 0
+    high_gap_epochs = 0
+    overfit_suspected = False
     history: list[dict[str, Any]] = []
+    warnings = list(split_audit["warnings"]) + low_support_warnings
+    warning_text = " ".join(dict.fromkeys(warnings)) if warnings else None
 
-    def checkpoint_payload(epoch: int, score: float) -> dict[str, Any]:
+    def checkpoint_payload(epoch: int, score: float, validation_metrics) -> dict[str, Any]:
         return {
             "format_version": 1,
             "backbone": selected_backbone,
@@ -241,28 +331,33 @@ def train_multitask_classifier(
             "std": IMAGE_STD,
             "state_dict": model.state_dict(),
             "epoch": epoch,
+            "selection_metric": "validation_macro_f1",
             "validation_score": score,
+            "validation_metrics": validation_metrics,
+            "split_strategy": split_audit["strategy"],
         }
 
-    warnings = [item for item in (split_warning,) if item]
-    if missing_training_classes:
-        missing_text = "; ".join(
-            f"{key}: {', '.join(values)}" for key, values in missing_training_classes.items()
-        )
-        warnings.append("These classes have no training examples and cannot be learned yet: " + missing_text)
-    warning_text = " ".join(warnings) if warnings else None
     if progress:
         progress({
             "state": "started",
-            "message": f"Training {selected_backbone} on {device}; {len(split['train'])} train / "
-                       f"{len(split['val'])} validation / {len(split['test'])} test images.",
+            "message": (
+                f"Training {selected_backbone} on {device}; "
+                f"{len(split['train'])} train / {len(split['val'])} validation / "
+                f"{len(split['test'])} test; split={split_audit['strategy']}."
+            ),
             "warning": warning_text,
+            "split_audit": split_audit,
         })
 
     for epoch in range(1, effective_epochs + 1):
         model.train()
         running_loss = 0.0
         batches = 0
+        train_confusions = [
+            torch.zeros((len(task["classes"]), len(task["classes"])), dtype=torch.long)
+            for task in tasks
+        ]
+
         for images, targets in train_loader:
             images = images.to(device, non_blocking=True)
             targets = [item.to(device, non_blocking=True) for item in targets]
@@ -270,7 +365,10 @@ def train_multitask_classifier(
             outputs = model(images)
             task_losses = [
                 torch.nn.functional.cross_entropy(
-                    outputs[index], targets[index], weight=task_class_weights[index]
+                    outputs[index],
+                    targets[index],
+                    weight=task_class_weights[index],
+                    label_smoothing=LABEL_SMOOTHING,
                 )
                 for index in range(len(tasks))
             ]
@@ -278,39 +376,88 @@ def train_multitask_classifier(
             if not torch.isfinite(loss):
                 raise RuntimeError("Training produced a non-finite loss. Check labels and image files.")
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
             optimizer.step()
             running_loss += float(loss.detach().item())
             batches += 1
+            _update_confusions(train_confusions, outputs, targets)
 
-        val_loss, val_accuracies = _evaluate(model, val_loader, tasks, device)
-        val_score = sum(val_accuracies.values()) / len(tasks)
-        scheduler.step(val_score)
+        train_metrics = _metrics_from_confusions(train_confusions, tasks)
+        val_loss, val_metrics = _evaluate(model, val_loader, tasks, device)
+        train_macro_f1 = sum(item["macro_f1"] for item in train_metrics.values()) / len(tasks)
+        val_macro_f1 = sum(item["macro_f1"] for item in val_metrics.values()) / len(tasks)
+        train_accuracy = {
+            key: item["accuracy"] for key, item in train_metrics.items()
+        }
+        val_accuracy = {
+            key: item["accuracy"] for key, item in val_metrics.items()
+        }
+
+        generalization_gap = train_macro_f1 - val_macro_f1
+        if generalization_gap >= OVERFIT_GAP_THRESHOLD:
+            high_gap_epochs += 1
+        else:
+            high_gap_epochs = 0
+        if high_gap_epochs >= 3:
+            overfit_suspected = True
+
+        scheduler.step(val_macro_f1)
         record = {
             "epoch": epoch,
             "train_loss": running_loss / max(1, batches),
             "validation_loss": val_loss,
-            "validation_accuracy": val_accuracies,
-            "validation_mean_accuracy": val_score,
+            "train_accuracy": train_accuracy,
+            "validation_accuracy": val_accuracy,
+            "train_macro_f1": train_macro_f1,
+            "validation_macro_f1": {
+                key: item["macro_f1"] for key, item in val_metrics.items()
+            },
+            "validation_mean_macro_f1": val_macro_f1,
+            "generalization_gap_macro_f1": generalization_gap,
+            "train_metrics": train_metrics,
+            "validation_metrics": val_metrics,
             "learning_rate_backbone": optimizer.param_groups[0]["lr"],
+            "learning_rate_heads": optimizer.param_groups[1]["lr"],
         }
         history.append(record)
         if progress:
             progress({"state": "epoch", **record})
 
-        if val_score > best_score:
-            best_score = val_score
+        if val_macro_f1 > best_score + 1e-4:
+            best_score = val_macro_f1
             best_epoch = epoch
+            best_record = record
             epochs_without_improvement = 0
-            torch.save(checkpoint_payload(epoch, val_score), run_dir / "best.pt")
+            torch.save(
+                checkpoint_payload(epoch, val_macro_f1, val_metrics),
+                run_dir / "best.pt",
+            )
         else:
             epochs_without_improvement += 1
-        torch.save(checkpoint_payload(epoch, val_score), run_dir / "last.pt")
-        if epochs_without_improvement >= patience:
+
+        torch.save(
+            checkpoint_payload(epoch, val_macro_f1, val_metrics),
+            run_dir / "last.pt",
+        )
+        if epochs_without_improvement >= EARLY_STOPPING_PATIENCE:
             break
+
+    if best_record is None:
+        raise RuntimeError("Training ended without producing a validation-selected checkpoint.")
 
     best_checkpoint = torch.load(run_dir / "best.pt", map_location=device, weights_only=False)
     model.load_state_dict(best_checkpoint["state_dict"])
-    test_loss, test_accuracies = _evaluate(model, test_loader, tasks, device)
+    test_loss, test_metrics = _evaluate(model, test_loader, tasks, device)
+    test_accuracy = {key: item["accuracy"] for key, item in test_metrics.items()}
+    test_macro_f1 = {key: item["macro_f1"] for key, item in test_metrics.items()}
+
+    if overfit_suspected:
+        warnings.append(
+            "A persistent train/validation macro-F1 gap above 0.20 was observed for at least "
+            "three epochs. The best validation checkpoint was retained; collect more diverse "
+            "sessions and review class balance."
+        )
+    warnings = list(dict.fromkeys(warnings))
 
     report = {
         "status": "complete",
@@ -322,13 +469,31 @@ def train_multitask_classifier(
         "best_checkpoint": str(run_dir / "best.pt"),
         "last_checkpoint": str(run_dir / "last.pt"),
         "annotated_samples": len(rows),
-        "split_counts": {key: len(value) for key, value in split.items()},
-        "split_warning": split_warning,
-        "missing_training_classes": missing_training_classes,
+        "split_counts": split_audit["counts"],
+        "split_strategy": split_audit["strategy"],
+        "split_audit": split_audit,
+        "split_warning": " ".join(split_audit["warnings"]) or None,
+        "excluded_near_boundaries": split_audit["excluded_near_boundaries"],
+        "class_distribution": split_audit["class_distribution"],
         "best_epoch": best_epoch,
-        "best_validation_mean_accuracy": best_score,
+        "selection_metric": "validation_macro_f1",
+        "best_validation_macro_f1": best_score,
+        "best_validation_mean_accuracy": sum(best_record["validation_accuracy"].values()) / len(tasks),
+        "best_validation_metrics": best_record["validation_metrics"],
         "test_loss": test_loss,
-        "test_accuracy": test_accuracies,
+        "test_accuracy": test_accuracy,
+        "test_macro_f1": test_macro_f1,
+        "test_metrics": test_metrics,
+        "overfit_suspected": overfit_suspected,
+        "warnings": warnings,
+        "regularization": {
+            "dropout": DROPOUT_RATE,
+            "weight_decay": WEIGHT_DECAY,
+            "label_smoothing": LABEL_SMOOTHING,
+            "gradient_clip_norm": 2.0,
+            "early_stopping_patience": EARLY_STOPPING_PATIENCE,
+            "selection_metric": "mean_validation_macro_f1",
+        },
         "tasks": tasks,
         "history": history,
     }
@@ -341,12 +506,20 @@ def train_multitask_classifier(
             {
                 "backbone": selected_backbone,
                 "epochs_requested": effective_epochs,
-                "batch_size": int(batch_size),
-                "learning_rate": float(learning_rate),
+                "batch_size": effective_batch_size,
+                "learning_rate_backbone": float(learning_rate),
+                "learning_rate_heads": float(learning_rate) * 5.0,
                 "pretrained": bool(pretrained),
                 "seed": int(seed),
                 "input_size": IMAGE_SIZE,
                 "tasks": tasks,
+                "split_audit": split_audit,
+                "regularization": report["regularization"],
+                "augmentation": {
+                    "color_jitter_probability": 0.7,
+                    "small_affine_probability": 0.35,
+                    "horizontal_flip": False,
+                },
             },
             indent=2,
             ensure_ascii=False,
