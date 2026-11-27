@@ -525,7 +525,11 @@ class ClassificationPage(QWidget):
         }
         for index, mode in enumerate(("annotated", "pending", "all")):
             self.annotation_filter_combo.setItemText(index, f"{labels[mode]} ({counts[mode]:,})")
-        mode_label = labels.get(self.annotation_filter, "All imported").lower()
+        mode_label = {
+            "annotated": "annotated",
+            "pending": "pending",
+            "all": "imported",
+        }.get(self.annotation_filter, "imported")
         self.dataset_status.setText(
             f"Dataset: {self.dataset_root} · {total:,} images · "
             f"{complete:,} fully annotated · {pending:,} pending"
