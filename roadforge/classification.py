@@ -298,23 +298,20 @@ class ClassificationPage(QWidget):
     def _update_task_visibility(self, *_):
         count = self.task_count.value()
         while self.task_grid.count():
-            item = self.task_grid.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.setParent(None)
+            self.task_grid.takeAt(0)
 
         for group in self.task_boxes:
             group.hide()
 
         if count == 1:
-            self.task_boxes[0].show()
             self.task_grid.addWidget(self.task_boxes[0], 0, 0, 1, 2)
+            self.task_boxes[0].show()
         else:
             for index in range(count):
                 row, column = divmod(index, 2)
                 span = 2 if count == 3 and index == 2 else 1
-                self.task_boxes[index].show()
                 self.task_grid.addWidget(self.task_boxes[index], row, column, 1, span)
+                self.task_boxes[index].show()
 
         self.task_grid.setColumnStretch(0, 1)
         self.task_grid.setColumnStretch(1, 1)
