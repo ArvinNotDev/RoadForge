@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import hashlib
 import json
 import random
@@ -433,28 +434,38 @@ def _build_classification_split(
     for group_key, values in groups.items():
         counts: Counter[str] = Counter()
         for row in values:
-            counts.update(_label_tokens(row))
-            token_totals.update(_label_tokens(row))
+            labels = _label_tokens(row)
+            counts.update(labels)
+            token_totals.update(labels)
         group_token_counts[group_key] = counts
         token_group_support.update(counts.keys())
 
     tokens = sorted(token_totals)
     total_samples = len(samples)
+    split_names = ("train", "val", "test")
+    # Use integer quotas so ordinary one-image groups produce the requested
+    # 80/10/10 counts exactly. Any rounding remainder is assigned to test.
     target_sizes = {
-        part: total_samples * normalized[part]
-        for part in ("train", "val", "test")
+        part: int(total_samples * normalized[part])
+        for part in split_names
     }
+    remainder = total_samples - sum(target_sizes.values())
+    for part in ("test", "val", "train"):
+        if remainder <= 0:
+            break
+        target_sizes[part] += 1
+        remainder -= 1
+
     target_tokens = {
         part: {
             token: token_totals[token] * normalized[part]
             for token in tokens
         }
-        for part in ("train", "val", "test")
+        for part in split_names
     }
 
     best_assignment: dict[str, str] | None = None
     best_score = float("inf")
-    split_names = ("train", "val", "test")
     # Multiple deterministic greedy passes make the assignment less sensitive
     # to tie-breaking while remaining reproducible for a given seed.
     attempts = min(192, max(64, len(groups) // 2))
@@ -464,7 +475,7 @@ def _build_classification_split(
         rng.shuffle(ordered)
 
         def rarity(item):
-            group_key, values = item
+            group_key, _values = item
             return sum(
                 1.0 / max(1, token_group_support[token])
                 for token in group_token_counts[group_key]
@@ -487,11 +498,19 @@ def _build_classification_split(
             additions = group_token_counts[group_key]
             remaining_groups = len(ordered) - position
             missing_parts = [part for part in split_names if sizes[part] == 0]
-            candidates = missing_parts if remaining_groups <= len(missing_parts) else list(split_names)
+            eligible = [
+                part for part in split_names
+                if sizes[part] + group_size <= target_sizes[part]
+            ]
+            candidates = eligible or list(split_names)
+            if remaining_groups <= len(missing_parts):
+                reserved = [part for part in missing_parts if part in candidates]
+                if reserved:
+                    candidates = reserved
 
             def cost(part: str) -> tuple[float, float, str]:
                 before_size = sizes[part]
-                target_size = max(target_sizes[part], 1.0)
+                target_size = max(float(target_sizes[part]), 1.0)
                 size_delta = (
                     ((before_size + group_size - target_size) / target_size) ** 2
                     - ((before_size - target_size) / target_size) ** 2
@@ -507,10 +526,12 @@ def _build_classification_split(
                     )
                     if token_group_support[token] >= 3 and before == 0:
                         coverage_bonus += 1.0
+                overflow = max(0, before_size + group_size - target_sizes[part])
                 score = (
                     size_delta
                     + 0.85 * class_delta / max(1, len(tokens))
                     - 0.75 * coverage_bonus
+                    + 100.0 * overflow
                 )
                 return score, before_size / target_size, part
 
@@ -539,6 +560,54 @@ def _build_classification_split(
 
     if best_assignment is None:
         raise RuntimeError("Could not construct a stratified image split.")
+
+    # Refine the chosen split by swapping equally sized image groups. This
+    # preserves exact partition sizes while improving multi-task class balance.
+    class_counts = {part: Counter() for part in split_names}
+    for group_key, part in best_assignment.items():
+        class_counts[part].update(group_token_counts[group_key])
+    equal_size_buckets: dict[int, list[str]] = {}
+    for group_key, values in groups.items():
+        equal_size_buckets.setdefault(len(values), []).append(group_key)
+    swap_buckets = [values for values in equal_size_buckets.values() if len(values) >= 2]
+    if swap_buckets and tokens:
+        rng = random.Random(int(seed) + 104729)
+        swap_steps = min(30000, max(4000, len(groups) * 60))
+        for _ in range(swap_steps):
+            bucket = rng.choice(swap_buckets)
+            left_group, right_group = rng.sample(bucket, 2)
+            left_part = best_assignment[left_group]
+            right_part = best_assignment[right_group]
+            if left_part == right_part:
+                continue
+            left_tokens = group_token_counts[left_group]
+            right_tokens = group_token_counts[right_group]
+            affected_tokens = set(left_tokens) | set(right_tokens)
+            delta = 0.0
+            for token in affected_tokens:
+                left_before = class_counts[left_part][token]
+                right_before = class_counts[right_part][token]
+                left_after = left_before - left_tokens[token] + right_tokens[token]
+                right_after = right_before - right_tokens[token] + left_tokens[token]
+                left_target = max(target_tokens[left_part][token], 1.0)
+                right_target = max(target_tokens[right_part][token], 1.0)
+                delta += (
+                    (left_after - target_tokens[left_part][token]) ** 2 / left_target ** 2
+                    + (right_after - target_tokens[right_part][token]) ** 2 / right_target ** 2
+                    - (left_before - target_tokens[left_part][token]) ** 2 / left_target ** 2
+                    - (right_before - target_tokens[right_part][token]) ** 2 / right_target ** 2
+                )
+                if token_group_support[token] >= 3:
+                    delta += 100.0 * (
+                        int(left_after == 0) + int(right_after == 0)
+                        - int(left_before == 0) - int(right_before == 0)
+                    )
+            if delta < -1e-12:
+                best_assignment[left_group], best_assignment[right_group] = right_part, left_part
+                class_counts[left_part].subtract(left_tokens)
+                class_counts[left_part].update(right_tokens)
+                class_counts[right_part].subtract(right_tokens)
+                class_counts[right_part].update(left_tokens)
 
     split = {"train": [], "val": [], "test": []}
     for row, group_key in zip(samples, sample_group_keys):
