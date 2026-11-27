@@ -139,6 +139,35 @@ def test_single_session_uses_chronological_split_with_boundary_embargo():
     assert min(indices["test"]) - max(indices["val"]) >= 3
 
 
+def test_temporal_fallback_deduplicates_identical_images_across_partitions():
+    from datetime import datetime, timedelta, timezone
+
+    start = datetime(2026, 11, 1, tzinfo=timezone.utc)
+    samples = []
+    for index in range(100):
+        samples.append({
+            "sample_id": f"frame-{index}",
+            "session_id": "one-session",
+            "captured_at": (start + timedelta(seconds=index)).isoformat(),
+            "sha256": f"hash-{index}",
+            "labels": {
+                "obstacle_ahead": "yes" if index % 2 else "no",
+                "traffic_sign": "stop" if index % 5 == 0 else "no_sign",
+            },
+        })
+    samples[95]["sha256"] = samples[0]["sha256"]
+
+    split, warning = split_samples(samples)
+    assert warning
+    occurrences = [
+        row for rows in split.values()
+        for row in rows
+        if row["sha256"] == samples[0]["sha256"]
+    ]
+    assert len(occurrences) == 1
+    assert any(row["sample_id"] == "frame-0" for row in split["train"])
+
+
 def test_session_split_keeps_classes_unique_to_one_session_in_training():
     samples = []
     for session in range(5):
