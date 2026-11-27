@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import random
+from collections import Counter
 import re
 import shutil
 import tempfile
@@ -464,6 +465,18 @@ def _build_classification_split(
                     current_tokens["train"][token] += sum(
                         token in _label_tokens(row) for row in session_groups[group]
                     )
+
+            # Always reserve a training session, including balanced datasets in
+            # which no class is unique to a single session.
+            if not assigned:
+                selected_train = max(remaining, key=lambda group: group_sizes[group])
+                assigned[selected_train] = "train"
+                current_sizes["train"] += group_sizes[selected_train]
+                for token in group_tokens[selected_train]:
+                    current_tokens["train"][token] += sum(
+                        token in _label_tokens(row) for row in session_groups[selected_train]
+                    )
+                remaining.remove(selected_train)
 
             def assignment_cost(group: str, part: str) -> float:
                 size_after = dict(current_sizes)
