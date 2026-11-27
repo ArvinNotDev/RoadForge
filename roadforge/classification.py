@@ -198,7 +198,6 @@ class ClassificationPage(QWidget):
         self.image_preview = QLabel("No image selected")
         self.image_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.image_preview.setMinimumSize(420, 300)
-        self.image_preview.setSizePolicy(self.image_preview.sizePolicy().horizontalPolicy(), self.image_preview.sizePolicy().verticalPolicy())
         self.image_preview.setStyleSheet(
             "background:#0b1118;border:1px solid #29394b;border-radius:8px;color:#9aaabc;padding:10px;"
         )
