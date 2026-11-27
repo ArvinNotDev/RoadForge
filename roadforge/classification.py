@@ -212,7 +212,10 @@ class ClassificationPage(QWidget):
         label_panel_layout = QVBoxLayout(self.label_panel)
         label_panel_layout.setContentsMargins(12, 16, 12, 12)
         label_panel_layout.setSpacing(10)
-        label_hint = QLabel("Select one class for every task. Unlabeled frames start with no selection.")
+        label_hint = QLabel(
+            "New frames reuse the last saved class for each task. Change a class only when needed; "
+            "the defaults update after Save Labels & Next."
+        )
         label_hint.setObjectName("Muted")
         label_hint.setWordWrap(True)
         label_panel_layout.addWidget(label_hint)
