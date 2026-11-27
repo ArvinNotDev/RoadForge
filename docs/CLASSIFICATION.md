@@ -40,7 +40,7 @@ Only enable the tasks you intend to train. The class names are editable. A task/
 
 Choose the AVIS capture folder and click **Import AVIS Captures**. Images are copied into the classification dataset; the original AVIS capture directory is left untouched. Exact SHA-256 duplicates are skipped. Each sample has a stable ID, source path, session ID, capture time, optional telemetry, and a label dictionary.
 
-The annotation view presents one image at a time. Select one class for each configured task and click **Save Labels & Next**. **Skip for now** advances without writing labels. Partially annotated images are not included in training; all configured tasks must have a valid class for a sample to be used.
+The annotation view presents one image at a time. Select one class for each configured task and click **Save Labels & Next**. After a successful save, those labels become the defaults for the next unannotated frame, so repeated classes can be confirmed quickly. Unsaved changes are never carried forward. The last saved labels are restored from the dataset when Classification Lab is reopened. **Skip for now** advances without writing labels. Partially annotated images are not included in training; all configured tasks must have a valid class for a sample to be used.
 
 Dataset layout:
 
