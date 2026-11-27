@@ -139,6 +139,34 @@ def test_single_session_uses_chronological_split_with_boundary_embargo():
     assert min(indices["test"]) - max(indices["val"]) >= 3
 
 
+def test_legacy_temporal_split_uses_a_multi_sample_embargo_without_timestamps():
+    samples = []
+    for index in range(100):
+        samples.append({
+            "sample_id": f"legacy-{index}",
+            "session_id": "legacy-session",
+            "labels": {
+                "obstacle_ahead": "yes" if index % 2 else "no",
+                "traffic_sign": "stop" if index % 5 == 0 else "no_sign",
+            },
+        })
+
+    split, warning = split_samples(samples, seed=21)
+    assert warning and "sequence-order window" in warning
+    positions = {
+        part: {
+            int(row["sample_id"].removeprefix("legacy-"))
+            for row in rows
+        }
+        for part, rows in split.items()
+    }
+    assert all(positions.values())
+    assert max(positions["train"]) < min(positions["val"])
+    assert max(positions["val"]) < min(positions["test"])
+    assert min(positions["val"]) - max(positions["train"]) >= 7
+    assert min(positions["test"]) - max(positions["val"]) >= 7
+
+
 def test_temporal_fallback_deduplicates_identical_images_across_partitions():
     from datetime import datetime, timedelta, timezone
 
