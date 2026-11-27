@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import hashlib
 import json
 import random
@@ -391,14 +390,6 @@ def _build_classification_split(
     seed: int = 42,
     ratios: dict[str, float] | None = None,
 ) -> tuple[dict[str, list[dict[str, Any]]], str | None, str, int]:
-    """Build an in-domain, multi-task stratified image split.
-
-    AVIS classification is commonly trained for one fixed road/camera setup.
-    In that workflow, keeping an entire capture session in one partition can
-    strand classes that were only annotated during one session. We therefore
-    stratify individual images across the requested partitions while keeping
-    exact SHA-256 duplicates together.
-    """
     if len(samples) < 3:
         raise ValueError(
             "At least three fully annotated images are required to create train/validation/test splits."
@@ -406,222 +397,188 @@ def _build_classification_split(
 
     requested = ratios or {"train": 0.8, "val": 0.1, "test": 0.1}
     normalized = {name: float(requested.get(name, 0.0)) for name in ("train", "val", "test")}
-    if any(not math.isfinite(value) or value < 0 or value > 1 for value in normalized.values()):
-        raise ValueError("Split ratios must be finite values between 0 and 1.")
+    if any(value < 0 or value > 1 for value in normalized.values()):
+        raise ValueError("Split ratios must be between 0 and 1.")
     if abs(sum(normalized.values()) - 1.0) > 1e-6 or any(value <= 0 for value in normalized.values()):
         raise ValueError("Train, validation and test ratios must each be non-zero and total 100%.")
 
-    # Group byte-identical images before stratification. Distinct video frames
-    # are intentionally allowed to land in different partitions for this
-    # fixed-domain workflow.
-    groups: dict[str, list[dict[str, Any]]] = {}
-    sample_group_keys: list[str] = []
-    for index, row in enumerate(samples):
+    # First group by independent AVIS sessions. Exact byte-identical images
+    # from legacy datasets are unioned so they cannot cross split boundaries.
+    session_keys = [
+        str(row.get("session_id") or row.get("group_id") or row.get("collection") or "unknown-session")
+        for row in samples
+    ]
+    parents = {key: key for key in session_keys}
+
+    def find(key: str) -> str:
+        while parents[key] != key:
+            parents[key] = parents[parents[key]]
+            key = parents[key]
+        return key
+
+    def union(left: str, right: str) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            parents[left_root] = right_root
+
+    digest_owner: dict[str, str] = {}
+    for row, session_key in zip(samples, session_keys):
         digest = str(row.get("sha256") or row.get("content_hash") or "").strip().lower()
-        sample_id = str(row.get("sample_id") or index)
-        key = f"sha256:{digest}" if digest else f"sample:{sample_id}:{index}"
-        groups.setdefault(key, []).append(row)
-        sample_group_keys.append(key)
+        if not digest:
+            continue
+        if digest in digest_owner:
+            union(session_key, digest_owner[digest])
+        else:
+            digest_owner[digest] = session_key
 
-    if len(groups) < 3:
-        raise ValueError(
-            "At least three distinct images are required after grouping exact duplicates."
-        )
+    session_groups: dict[str, list[dict[str, Any]]] = {}
+    for row, session_key in zip(samples, session_keys):
+        session_groups.setdefault(find(session_key), []).append(row)
 
-    group_token_counts: dict[str, Counter[str]] = {}
-    token_totals: Counter[str] = Counter()
-    token_group_support: Counter[str] = Counter()
-    for group_key, values in groups.items():
-        counts: Counter[str] = Counter()
-        for row in values:
-            labels = _label_tokens(row)
-            counts.update(labels)
-            token_totals.update(labels)
-        group_token_counts[group_key] = counts
-        token_group_support.update(counts.keys())
-
-    tokens = sorted(token_totals)
-    total_samples = len(samples)
-    split_names = ("train", "val", "test")
-    # Use integer quotas so ordinary one-image groups produce the requested
-    # 80/10/10 counts exactly. Any rounding remainder is assigned to test.
-    target_sizes = {
-        part: int(total_samples * normalized[part])
-        for part in split_names
-    }
-    remainder = total_samples - sum(target_sizes.values())
-    for part in ("test", "val", "train"):
-        if remainder <= 0:
-            break
-        target_sizes[part] += 1
-        remainder -= 1
-
-    target_tokens = {
-        part: {
-            token: token_totals[token] * normalized[part]
-            for token in tokens
+    if len(session_groups) >= 3:
+        group_tokens = {
+            group: set().union(*(_label_tokens(row) for row in values))
+            for group, values in session_groups.items()
         }
-        for part in split_names
-    }
+        token_groups: dict[str, set[str]] = {}
+        for group, tokens in group_tokens.items():
+            for token in tokens:
+                token_groups.setdefault(token, set()).add(group)
 
-    best_assignment: dict[str, str] | None = None
-    best_score = float("inf")
-    # Multiple deterministic greedy passes make the assignment less sensitive
-    # to tie-breaking while remaining reproducible for a given seed.
-    attempts = min(192, max(64, len(groups) // 2))
-    for attempt in range(attempts):
-        rng = random.Random(int(seed) + attempt * 7919)
-        ordered = list(groups.items())
-        rng.shuffle(ordered)
-
-        def rarity(item):
-            group_key, _values = item
-            return sum(
-                1.0 / max(1, token_group_support[token])
-                for token in group_token_counts[group_key]
-            )
-
-        ordered.sort(
-            key=lambda item: (
-                -rarity(item),
-                -len(item[1]),
-                rng.random(),
-            )
-        )
-
-        assigned: dict[str, str] = {}
-        sizes: Counter[str] = Counter()
-        class_counts = {part: Counter() for part in split_names}
-
-        for position, (group_key, values) in enumerate(ordered):
-            group_size = len(values)
-            additions = group_token_counts[group_key]
-            remaining_groups = len(ordered) - position
-            missing_parts = [part for part in split_names if sizes[part] == 0]
-            eligible = [
-                part for part in split_names
-                if sizes[part] + group_size <= target_sizes[part]
-            ]
-            candidates = eligible or list(split_names)
-            if remaining_groups <= len(missing_parts):
-                reserved = [part for part in missing_parts if part in candidates]
-                if reserved:
-                    candidates = reserved
-
-            def cost(part: str) -> tuple[float, float, str]:
-                before_size = sizes[part]
-                target_size = max(float(target_sizes[part]), 1.0)
-                size_delta = (
-                    ((before_size + group_size - target_size) / target_size) ** 2
-                    - ((before_size - target_size) / target_size) ** 2
-                )
-                class_delta = 0.0
-                coverage_bonus = 0.0
-                for token, amount in additions.items():
-                    before = class_counts[part][token]
-                    target = max(target_tokens[part][token], 1.0)
-                    class_delta += (
-                        ((before + amount - target) / target) ** 2
-                        - ((before - target) / target) ** 2
+        # If a class occurs in only one independent session, that session must
+        # remain in training. Otherwise a random session split could create a
+        # checkpoint that never learned one of its configured classes.
+        mandatory_train = {
+            next(iter(groups))
+            for groups in token_groups.values()
+            if len(groups) == 1
+        }
+        remaining = [group for group in session_groups if group not in mandatory_train]
+        if len(remaining) >= 2:
+            rng = random.Random(int(seed))
+            rng.shuffle(remaining)
+            group_sizes = {key: len(value) for key, value in session_groups.items()}
+            all_tokens = sorted(token_groups)
+            token_totals = {
+                token: sum(token in _label_tokens(row) for row in samples)
+                for token in all_tokens
+            }
+            total_samples = len(samples)
+            target_sizes = {
+                part: total_samples * normalized[part]
+                for part in ("train", "val", "test")
+            }
+            target_tokens = {
+                part: {
+                    token: token_totals[token] * normalized[part]
+                    for token in all_tokens
+                }
+                for part in ("train", "val", "test")
+            }
+            assigned: dict[str, str] = {group: "train" for group in mandatory_train}
+            current_sizes = Counter()
+            current_tokens = {
+                part: Counter()
+                for part in ("train", "val", "test")
+            }
+            for group in mandatory_train:
+                current_sizes["train"] += group_sizes[group]
+                for token in group_tokens[group]:
+                    current_tokens["train"][token] += sum(
+                        token in _label_tokens(row) for row in session_groups[group]
                     )
-                    if token_group_support[token] >= 3 and before == 0:
-                        coverage_bonus += 1.0
-                overflow = max(0, before_size + group_size - target_sizes[part])
-                score = (
-                    size_delta
-                    + 0.85 * class_delta / max(1, len(tokens))
-                    - 0.75 * coverage_bonus
-                    + 100.0 * overflow
-                )
-                return score, before_size / target_size, part
 
-            selected = min(candidates, key=cost)
-            assigned[group_key] = selected
-            sizes[selected] += group_size
-            class_counts[selected].update(additions)
-
-        size_loss = sum(
-            ((sizes[part] - target_sizes[part]) / max(target_sizes[part], 1.0)) ** 2
-            for part in split_names
-        )
-        class_loss = 0.0
-        missing_coverage = 0
-        for token in tokens:
-            for part in split_names:
-                target = max(target_tokens[part][token], 1.0)
-                actual = class_counts[part][token]
-                class_loss += ((actual - target) / target) ** 2
-                if token_group_support[token] >= 3 and actual == 0:
-                    missing_coverage += 1
-        score = size_loss + 0.85 * class_loss / max(1, len(tokens)) + 100.0 * missing_coverage
-        if score < best_score:
-            best_score = score
-            best_assignment = assigned
-
-    if best_assignment is None:
-        raise RuntimeError("Could not construct a stratified image split.")
-
-    # Refine the chosen split by swapping equally sized image groups. This
-    # preserves exact partition sizes while improving multi-task class balance.
-    class_counts = {part: Counter() for part in split_names}
-    for group_key, part in best_assignment.items():
-        class_counts[part].update(group_token_counts[group_key])
-    equal_size_buckets: dict[int, list[str]] = {}
-    for group_key, values in groups.items():
-        equal_size_buckets.setdefault(len(values), []).append(group_key)
-    swap_buckets = [values for values in equal_size_buckets.values() if len(values) >= 2]
-    if swap_buckets and tokens:
-        rng = random.Random(int(seed) + 104729)
-        swap_steps = min(30000, max(4000, len(groups) * 60))
-        for _ in range(swap_steps):
-            bucket = rng.choice(swap_buckets)
-            left_group, right_group = rng.sample(bucket, 2)
-            left_part = best_assignment[left_group]
-            right_part = best_assignment[right_group]
-            if left_part == right_part:
-                continue
-            left_tokens = group_token_counts[left_group]
-            right_tokens = group_token_counts[right_group]
-            affected_tokens = set(left_tokens) | set(right_tokens)
-            delta = 0.0
-            for token in affected_tokens:
-                left_before = class_counts[left_part][token]
-                right_before = class_counts[right_part][token]
-                left_after = left_before - left_tokens[token] + right_tokens[token]
-                right_after = right_before - right_tokens[token] + left_tokens[token]
-                left_target = max(target_tokens[left_part][token], 1.0)
-                right_target = max(target_tokens[right_part][token], 1.0)
-                delta += (
-                    (left_after - target_tokens[left_part][token]) ** 2 / left_target ** 2
-                    + (right_after - target_tokens[right_part][token]) ** 2 / right_target ** 2
-                    - (left_before - target_tokens[left_part][token]) ** 2 / left_target ** 2
-                    - (right_before - target_tokens[right_part][token]) ** 2 / right_target ** 2
-                )
-                if token_group_support[token] >= 3:
-                    delta += 100.0 * (
-                        int(left_after == 0) + int(right_after == 0)
-                        - int(left_before == 0) - int(right_before == 0)
+            # Always reserve a training session, including balanced datasets in
+            # which no class is unique to a single session.
+            if not assigned:
+                selected_train = max(remaining, key=lambda group: group_sizes[group])
+                assigned[selected_train] = "train"
+                current_sizes["train"] += group_sizes[selected_train]
+                for token in group_tokens[selected_train]:
+                    current_tokens["train"][token] += sum(
+                        token in _label_tokens(row) for row in session_groups[selected_train]
                     )
-            if delta < -1e-12:
-                best_assignment[left_group], best_assignment[right_group] = right_part, left_part
-                class_counts[left_part].subtract(left_tokens)
-                class_counts[left_part].update(right_tokens)
-                class_counts[right_part].subtract(right_tokens)
-                class_counts[right_part].update(left_tokens)
+                remaining.remove(selected_train)
 
-    split = {"train": [], "val": [], "test": []}
-    for row, group_key in zip(samples, sample_group_keys):
-        split[best_assignment[group_key]].append(row)
-    if any(not split[part] for part in split_names):
-        raise ValueError("The available distinct images cannot populate all three requested splits.")
+            def assignment_cost(group: str, part: str) -> float:
+                size_after = dict(current_sizes)
+                size_after[part] = size_after.get(part, 0) + group_sizes[group]
+                size_cost = sum(
+                    ((size_after.get(name, 0) - target_sizes[name]) / max(target_sizes[name], 1.0)) ** 2
+                    for name in ("train", "val", "test")
+                )
+                token_cost = 0.0
+                for token in all_tokens:
+                    for name in ("train", "val", "test"):
+                        value = current_tokens[name].get(token, 0)
+                        if name == part:
+                            value += sum(token in _label_tokens(row) for row in session_groups[group])
+                        target = target_tokens[name][token]
+                        token_cost += ((value - target) / max(target, 1.0)) ** 2
+                return size_cost + 0.35 * token_cost / max(1, len(all_tokens))
 
+            # Reserve one independent group for validation and one for test.
+            for part in ("val", "test"):
+                selected = min(remaining, key=lambda group: assignment_cost(group, part))
+                assigned[selected] = part
+                current_sizes[part] += group_sizes[selected]
+                for token in group_tokens[selected]:
+                    current_tokens[part][token] += sum(
+                        token in _label_tokens(row) for row in session_groups[selected]
+                    )
+                remaining.remove(selected)
+
+            # Allocate all remaining complete sessions against both sample-count
+            # targets and the per-class distribution targets.
+            token_frequency = {
+                token: max(1, len(groups))
+                for token, groups in token_groups.items()
+            }
+
+            def rarity(group: str) -> float:
+                return sum(1.0 / token_frequency[token] for token in group_tokens[group])
+
+            remaining.sort(
+                key=lambda group: (rarity(group), group_sizes[group]),
+                reverse=True,
+            )
+            for group in remaining:
+                part = min(
+                    ("train", "val", "test"),
+                    key=lambda candidate: assignment_cost(group, candidate),
+                )
+                assigned[group] = part
+                current_sizes[part] += group_sizes[group]
+                for token in group_tokens[group]:
+                    current_tokens[part][token] += sum(
+                        token in _label_tokens(row) for row in session_groups[group]
+                    )
+
+            split = {"train": [], "val": [], "test": []}
+            for group, values in session_groups.items():
+                split[assigned[group]].extend(values)
+            if all(split[name] for name in split):
+                return (
+                    split,
+                    None,
+                    "session_isolated",
+                    0,
+                )
+
+    # Fewer than three independent sessions (or class coverage that makes a
+    # strict session split impossible): use chronological holdout with a purge
+    # gap. This is deliberately not a random image-level fallback.
+    temporal, excluded = _temporal_split(samples)
     warning = (
-        "Image-level stratification is enabled for in-domain training. Frames from the same "
-        "AVIS capture session/route may appear in train, validation and test; this is intentional "
-        "for the fixed deployment environment, but validation/test scores should not be interpreted "
-        "as unseen-session generalization. Exact SHA-256 duplicate images remain in one partition."
+        f"Only {len(session_groups)} independent capture session group(s) are available, or a "
+        "session-only split could not preserve training-class coverage. RoadForge used a "
+        "chronological split with a temporal embargo; same-session frames near partition "
+        "boundaries were excluded (using capture times when available, otherwise a sequence-order "
+        "window). This reduces frame leakage but does not provide a fully "
+        "session-independent validation/test. Capture at least three separate AVIS runs for that."
     )
-    return split, warning, "image_stratified", 0
+    return temporal, warning, "temporal_embargo", excluded
+
 
 def split_samples(
     samples: list[dict[str, Any]],
@@ -691,23 +648,13 @@ def analyze_classification_split(
         })
         for part, values in split.items()
     }
-    session_parts: dict[str, set[str]] = {}
-    for part, values in split.items():
-        for row in values:
-            session = str(row.get("session_id") or row.get("group_id") or row.get("collection") or "unknown-session")
-            session_parts.setdefault(session, set()).add(part)
-    shared_sessions = {
-        session: sorted(parts)
-        for session, parts in sorted(session_parts.items())
-        if len(parts) > 1
-    }
     actual_ratios = {part: counts[part] / total for part in counts}
     for part in ("train", "val", "test"):
         if abs(actual_ratios[part] - 0.8 if part == "train" else actual_ratios[part] - 0.1) > 0.05:
             requested_ratio = 0.8 if part == "train" else 0.1
             warnings.append(
                 f"The {part} split is {actual_ratios[part]:.1%}, notably different from the "
-                f"requested {requested_ratio:.0%}; indivisible exact-duplicate groups can cause this."
+                f"requested {requested_ratio:.0%}; indivisible session groups can cause this."
             )
         if part in ("val", "test") and counts[part] < 5:
             warnings.append(
@@ -722,7 +669,6 @@ def analyze_classification_split(
         "excluded_near_boundaries": int(excluded),
         "class_distribution": class_distribution,
         "session_distribution": session_distribution,
-        "shared_sessions_across_splits": shared_sessions,
         "warnings": list(dict.fromkeys(warnings)),
         "errors": errors,
     }
