@@ -134,6 +134,76 @@ def test_classification_annotation_reuses_last_saved_labels_and_persists_them(tm
     reopened.close()
     app.processEvents()
 
+def test_classification_view_defaults_to_existing_annotations_and_keeps_pending_queue_separate(tmp_path):
+    import json
+
+    app = QApplication.instance() or QApplication([])
+    tasks = validate_tasks([
+        {"name": "Obstacle ahead", "classes": ["no", "yes"]},
+        {"name": "Sign", "classes": ["right", "left", "straight", "stop", "90r", "90l"]},
+    ])
+    ensure_dataset(tmp_path, tasks)
+    image_dir = tmp_path / "images"
+    rows = []
+    for index in range(6):
+        filename = f"frame-{index}.png"
+        image = QImage(32, 24, QImage.Format.Format_RGB32)
+        image.fill(Qt.GlobalColor.black)
+        assert image.save(str(image_dir / filename))
+        rows.append({
+            "sample_id": f"sample-{index}",
+            "image": f"images/{filename}",
+            "sha256": f"hash-{index}",
+            "session_id": "current-session" if index < 4 else "older-import-session",
+            "labels": (
+                {
+                    "obstacle_ahead": "yes" if index % 2 else "no",
+                    "sign": ("right", "left", "straight", "stop")[index],
+                }
+                if index < 4 else {}
+            ),
+        })
+    (tmp_path / "samples.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    page = ClassificationPage(tmp_path)
+    page._open_dataset(tmp_path)
+
+    # Default review shows the four completed annotations, not old pending imports.
+    assert page.annotation_filter_combo.currentData() == "annotated"
+    assert len(page.samples) == 4
+    assert page.annotation_counter.text().startswith("Showing 4 annotated images")
+    assert page.samples[0]["sample_id"] == "sample-0"
+    assert [combo.currentData() for _task, combo in page.annotation_combos] == ["no", "right"]
+
+    # Pending frames remain available in their own queue without mixing into review.
+    page.annotation_filter_combo.setCurrentIndex(page.annotation_filter_combo.findData("pending"))
+    assert len(page.samples) == 2
+    assert page.samples[0]["sample_id"] == "sample-4"
+
+    # Saving a pending frame removes it from the pending queue without skipping
+    # the next frame; the existing annotations remain intact.
+    page.annotation_combos[0][1].setCurrentIndex(page.annotation_combos[0][1].findData("yes"))
+    page.annotation_combos[1][1].setCurrentIndex(page.annotation_combos[1][1].findData("90r"))
+    page.save_and_next()
+    assert len(page.samples) == 1
+    assert page.samples[0]["sample_id"] == "sample-5"
+
+    saved = json.loads((tmp_path / "samples.jsonl").read_text(encoding="utf-8").splitlines()[4])
+    assert saved["labels"] == {"obstacle_ahead": "yes", "sign": "90r"}
+    assert rows[0]["labels"] == {"obstacle_ahead": "no", "sign": "right"}
+
+    # All imported images are still available on demand.
+    page.annotation_filter_combo.setCurrentIndex(page.annotation_filter_combo.findData("all"))
+    assert len(page.samples) == 6
+    page.annotation_filter_combo.setCurrentIndex(page.annotation_filter_combo.findData("annotated"))
+    assert len(page.samples) == 5
+    page.close()
+    app.processEvents()
+
+
 def test_classification_task_layout_expands_single_task_and_supports_three_tasks(tmp_path):
     app = QApplication.instance() or QApplication([])
     page = ClassificationPage(tmp_path)
