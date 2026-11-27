@@ -84,90 +84,150 @@ def test_capture_import_annotation_and_exact_duplicate_handling(tmp_path):
     assert len(load_dataset_config(dataset_root)["tasks"]) == 2
 
 
-def test_image_stratified_split_balances_rare_classes_across_all_partitions():
-    class_counts = {
-        "right": 135,
-        "left": 105,
-        "straight": 116,
-        "stop": 58,
-        "90r": 27,
-        "90l": 53,
-    }
+def test_session_split_keeps_each_session_in_one_partition():
     samples = []
-    sample_index = 0
-    for class_name, count in class_counts.items():
-        for frame in range(count):
-            if class_name in {"90r", "90l"}:
-                session_id = "rare-sign-session"
-            else:
-                session_id = "common-session-a" if frame % 2 else "common-session-b"
+    for session in range(5):
+        for index in range(3):
             samples.append({
-                "sample_id": f"frame-{sample_index}",
-                "session_id": session_id,
-                "sha256": f"unique-hash-{sample_index}",
-                "labels": {"sign": class_name},
+                "sample_id": f"{session}-{index}",
+                "session_id": f"session-{session}",
             })
-            sample_index += 1
-
-    tasks = validate_tasks([{"name": "Sign", "classes": list(class_counts)}])
-    split, audit = analyze_classification_split(samples, tasks, seed=7)
-
-    assert audit["strategy"] == "image_stratified"
-    assert not audit["errors"]
-    assert audit["counts"]["train"] + audit["counts"]["val"] + audit["counts"]["test"] == 494
-    assert 0.78 <= audit["actual_ratios"]["train"] <= 0.82
-    assert 0.08 <= audit["actual_ratios"]["val"] <= 0.12
-    assert 0.08 <= audit["actual_ratios"]["test"] <= 0.12
-    for part in ("train", "val", "test"):
-        assert all(
-            audit["class_distribution"][part]["sign"][name] > 0
-            for name in class_counts
-        )
-
-    # The rare classes are present in only one capture session, but are
-    # intentionally distributed across partitions for the fixed-road use case.
-    assert "rare-sign-session" in audit["session_distribution"]["train"]
-    assert "rare-sign-session" in audit["session_distribution"]["val"]
-    assert "rare-sign-session" in audit["session_distribution"]["test"]
-    assert "rare-sign-session" in audit["shared_sessions_across_splits"]
-    assert audit["excluded_near_boundaries"] == 0
-    assert any("unseen-session generalization" in item for item in audit["warnings"])
+    split, warning = split_samples(samples, seed=7)
+    assert warning is None
+    assert all(split.values())
+    membership = {}
+    for partition, rows in split.items():
+        for row in rows:
+            session = row["session_id"]
+            assert session not in membership or membership[session] == partition
+            membership[session] = partition
 
 
-def test_image_stratified_split_keeps_exact_duplicate_images_together():
+def test_single_session_uses_chronological_split_with_boundary_embargo():
+    from datetime import datetime, timedelta, timezone
+
+    start = datetime(2026, 11, 1, tzinfo=timezone.utc)
     samples = []
-    classes = ["right", "left", "straight"]
-    for index in range(30):
+    for index in range(100):
+        samples.append({
+            "sample_id": f"frame-{index}",
+            "session_id": "one-long-avis-session",
+            "captured_at": (start + timedelta(seconds=index)).isoformat(),
+            "labels": {
+                "obstacle_ahead": "yes" if index % 2 else "no",
+                "traffic_sign": "stop" if index % 5 == 0 else "no_sign",
+            },
+        })
+
+    split, warning = split_samples(samples, seed=123)
+    assert warning and "chronological" in warning
+    indices = {
+        part: {
+            int(row["sample_id"].removeprefix("frame-"))
+            for row in rows
+        }
+        for part, rows in split.items()
+    }
+    assert all(indices.values())
+    assert not (indices["train"] & indices["val"])
+    assert not (indices["train"] & indices["test"])
+    assert not (indices["val"] & indices["test"])
+    assert max(indices["train"]) < min(indices["val"])
+    assert max(indices["val"]) < min(indices["test"])
+    # The samples touching both same-session boundaries are embargoed.
+    assert min(indices["val"]) - max(indices["train"]) >= 3
+    assert min(indices["test"]) - max(indices["val"]) >= 3
+
+
+def test_legacy_temporal_split_uses_a_multi_sample_embargo_without_timestamps():
+    samples = []
+    for index in range(100):
+        samples.append({
+            "sample_id": f"legacy-{index}",
+            "session_id": "legacy-session",
+            "labels": {
+                "obstacle_ahead": "yes" if index % 2 else "no",
+                "traffic_sign": "stop" if index % 5 == 0 else "no_sign",
+            },
+        })
+
+    split, warning = split_samples(samples, seed=21)
+    assert warning and "sequence-order window" in warning
+    positions = {
+        part: {
+            int(row["sample_id"].removeprefix("legacy-"))
+            for row in rows
+        }
+        for part, rows in split.items()
+    }
+    assert all(positions.values())
+    assert max(positions["train"]) < min(positions["val"])
+    assert max(positions["val"]) < min(positions["test"])
+    assert min(positions["val"]) - max(positions["train"]) >= 7
+    assert min(positions["test"]) - max(positions["val"]) >= 7
+
+
+def test_temporal_fallback_deduplicates_identical_images_across_partitions():
+    from datetime import datetime, timedelta, timezone
+
+    start = datetime(2026, 11, 1, tzinfo=timezone.utc)
+    samples = []
+    for index in range(100):
         samples.append({
             "sample_id": f"frame-{index}",
             "session_id": "one-session",
+            "captured_at": (start + timedelta(seconds=index)).isoformat(),
             "sha256": f"hash-{index}",
-            "labels": {"sign": classes[index % len(classes)]},
+            "labels": {
+                "obstacle_ahead": "yes" if index % 2 else "no",
+                "traffic_sign": "stop" if index % 5 == 0 else "no_sign",
+            },
         })
-    samples.append({
-        "sample_id": "duplicate-of-frame-0",
-        "session_id": "another-session",
-        "sha256": "hash-0",
-        "labels": {"sign": "right"},
-    })
+    samples[95]["sha256"] = samples[0]["sha256"]
 
-    first, warning = split_samples(samples, seed=21)
-    second, second_warning = split_samples(samples, seed=21)
-    assert warning and "Image-level stratification" in warning
-    assert second_warning == warning
+    split, warning = split_samples(samples)
+    assert warning
+    occurrences = [
+        row for rows in split.values()
+        for row in rows
+        if row["sha256"] == samples[0]["sha256"]
+    ]
+    assert len(occurrences) == 1
+    assert any(row["sample_id"] == "frame-0" for row in split["train"])
+
+
+def test_session_split_keeps_classes_unique_to_one_session_in_training():
+    samples = []
+    for session in range(5):
+        for frame in range(10):
+            samples.append({
+                "sample_id": f"{session}-{frame}",
+                "session_id": f"session-{session}",
+                "labels": {
+                    "obstacle_ahead": "yes" if frame % 2 else "no",
+                    "traffic_sign": (
+                        "stop" if session == 0 and frame < 2
+                        else "speed_limit" if session > 0 and frame < 2
+                        else "no_sign"
+                    ),
+                },
+            })
+
+    split, audit = analyze_classification_split(samples, validate_tasks(TASKS), seed=7)
+    assert audit["strategy"] == "session_isolated"
+    assert not audit["errors"]
+    train_classes = {
+        row["labels"]["traffic_sign"] for row in split["train"]
+    }
+    assert {"stop", "speed_limit", "no_sign"} <= train_classes
 
     membership = {}
-    second_membership = {}
-    for part, rows in first.items():
+    for part, rows in split.items():
         for row in rows:
-            membership[row["sample_id"]] = part
-    for part, rows in second.items():
-        for row in rows:
-            second_membership[row["sample_id"]] = part
-    assert membership["frame-0"] == membership["duplicate-of-frame-0"]
-    assert membership == second_membership
-    assert all(first.values())
-
+            session = row["session_id"]
+            assert session not in membership or membership[session] == part
+            membership[session] = part
+    assert set(membership.values()) == {"train", "val", "test"}
 
 
 def test_schema_cannot_be_changed_after_annotations_exist(tmp_path):
