@@ -336,10 +336,15 @@ def _temporal_split(
             else:
                 excluded_indices.update((boundary - 1, boundary))
         else:
-            # With legacy captures, timestamps are unavailable. Drop the two
-            # samples touching each same-session boundary instead of randomly
-            # mixing adjacent frames into different partitions.
-            excluded_indices.update((boundary - 1, boundary))
+            # With legacy captures, timestamps are unavailable. Purge a small
+            # sequence window on both sides of each same-session boundary.
+            # The window grows with the dataset, with a minimum of three rows.
+            embargo_samples = max(3, int(round(count * 0.02)))
+            start = max(0, boundary - embargo_samples)
+            stop = min(count, boundary + embargo_samples)
+            for position in range(start, stop):
+                if str(ordered[position].get("session_id") or "unknown-session") == left_session:
+                    excluded_indices.add(position)
 
     partitions = {
         "train": [row for position, row in enumerate(ordered[:train_end]) if position not in excluded_indices],
@@ -567,8 +572,9 @@ def _build_classification_split(
     warning = (
         f"Only {len(session_groups)} independent capture session group(s) are available, or a "
         "session-only split could not preserve training-class coverage. RoadForge used a "
-        "chronological split with a temporal embargo; adjacent same-session frames near partition "
-        "boundaries were excluded. This reduces frame leakage but does not provide a fully "
+        "chronological split with a temporal embargo; same-session frames near partition "
+        "boundaries were excluded (using capture times when available, otherwise a sequence-order "
+        "window). This reduces frame leakage but does not provide a fully "
         "session-independent validation/test. Capture at least three separate AVIS runs for that."
     )
     return temporal, warning, "temporal_embargo", excluded
