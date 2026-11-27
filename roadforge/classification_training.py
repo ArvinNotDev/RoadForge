@@ -124,7 +124,7 @@ def _metrics_from_confusions(confusions, tasks):
 
     metrics: dict[str, dict[str, Any]] = {}
     for task, raw_matrix in zip(tasks, confusions):
-        matrix = raw_matrix.to(dtype=__import__("torch").float64)
+        matrix = raw_matrix.to(dtype=torch.float64)
         true_support = matrix.sum(dim=1)
         predicted_support = matrix.sum(dim=0)
         true_positive = matrix.diag()
@@ -150,7 +150,7 @@ def _metrics_from_confusions(confusions, tasks):
                 }
                 for index, class_name in enumerate(task["classes"])
             },
-            "confusion_matrix": matrix.to(dtype=__import__("torch").int64).tolist(),
+            "confusion_matrix": matrix.to(dtype=torch.int64).tolist(),
             "unsupported_classes": [
                 class_name
                 for index, class_name in enumerate(task["classes"])
@@ -182,7 +182,7 @@ def _evaluate(model, loader, tasks, device):
         for task in tasks
     ]
     total_loss = 0.0
-    batches = 0
+    total_samples = 0
     with torch.no_grad():
         for images, targets in loader:
             images = images.to(device, non_blocking=True)
@@ -192,10 +192,11 @@ def _evaluate(model, loader, tasks, device):
                 torch.nn.functional.cross_entropy(outputs[index], targets[index])
                 for index in range(len(tasks))
             ]
-            total_loss += float(torch.stack(losses).mean().item())
-            batches += 1
+            batch_count = int(images.shape[0])
+            total_loss += float(torch.stack(losses).mean().item()) * batch_count
+            total_samples += batch_count
             _update_confusions(confusions, outputs, targets)
-    return (total_loss / max(1, batches)), _metrics_from_confusions(confusions, tasks)
+    return (total_loss / max(1, total_samples)), _metrics_from_confusions(confusions, tasks)
 
 
 def train_multitask_classifier(
