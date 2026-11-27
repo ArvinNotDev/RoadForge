@@ -57,9 +57,13 @@ Choose either:
 - **ResNet18** — compact residual feature extractor with a 512-feature shared representation.
 - **EfficientNet-B0** — compact compound-scaled feature extractor with a 1280-feature shared representation.
 
-Both use a shared backbone and one independent linear classification head per task. Training uses cross-entropy for each head and averages the task losses. ImageNet pretrained weights are enabled by default and are recommended for small datasets; the first use may download the torchvision checkpoint. The input is resized to 224×224 and normalized with ImageNet statistics. Color jitter is used for training augmentation; horizontal flipping is deliberately avoided because it can reverse the meaning of road signs and driving manoeuvres.
+Both use a shared backbone, a 0.30 dropout layer, and one independent classification head per task. ImageNet pretrained weights are enabled by default and are recommended for small datasets; the first use may download the torchvision checkpoint. The input is resized to 224×224 and normalized with ImageNet statistics. Training augmentation uses restrained color jitter and small affine changes. Horizontal flipping is deliberately avoided because it can reverse the meaning of road signs and left/right driving manoeuvres.
 
-The backbone learning rate is lower than the task-head learning rate. Training selects the best checkpoint by mean validation accuracy and uses early stopping. GPU is selected automatically when CUDA is available; otherwise training runs on CPU.
+Training uses inverse-frequency class weights, light label smoothing, AdamW weight decay, gradient clipping, and a learning rate five times higher for the task heads than for the backbone. The learning-rate scheduler and early stopping monitor mean validation macro-F1 rather than raw accuracy, making model selection less sensitive to majority classes. Early stopping uses a patience of eight epochs. The training loop also tracks the train/validation macro-F1 gap and reports a persistent gap above 0.20 as a possible overfitting warning. These controls reduce overfitting risk but cannot replace more diverse, correctly annotated data.
+
+Before training, use **Preview train / validation / test split** to inspect sample counts, session counts, class balance, excluded boundary frames, and any blockers or warnings. The same split audit is saved in the run report. CUDA is selected automatically when available; otherwise training runs on CPU.
+
+The final report includes per-task accuracy, balanced accuracy, macro-F1, per-class precision/recall/F1, support counts, and confusion matrices. Validation is used for checkpoint selection; the held-out test split is evaluated only after the best validation checkpoint has been restored.
 
 Outputs are stored under:
 
@@ -87,6 +91,13 @@ Before reporting success, RoadForge checks the ONNX graph, loads it with ONNX Ru
 
 ## 6. Split policy and limitations
 
-RoadForge groups images by AVIS process/session whenever at least three sessions are available, keeping complete sessions in one split. With fewer than three sessions, it falls back to a deterministic image-level split and emits a warning; temporally adjacent frames can then leak across partitions. For meaningful evaluation, collect multiple separate AVIS runs and reserve unseen sessions for validation and test.
+The default target is 80% train, 10% validation, and 10% test.
+
+- With at least three independent AVIS session groups, RoadForge keeps complete sessions in one partition. Assignment considers both split size and per-class distribution. If a class occurs in only one session, that session is forced into training so the model is not asked to learn a class it never sees.
+- With fewer than three independent sessions, RoadForge does **not** randomly scatter individual frames. It creates chronological partitions and applies a two-second temporal embargo around same-session split boundaries. Boundary frames are excluded from all partitions. When timestamps are missing in older capture records, manifest/import order is used and the samples touching a same-session boundary are dropped.
+- Temporal fallback reduces adjacent-frame leakage, but it is not equivalent to a session-independent test. Collect at least three separate AVIS runs for the strongest evaluation; ideally keep a completely unseen run for final testing.
+- Training is blocked when any configured class is absent from the training partition or when the embargo leaves an empty partition. Missing classes in validation/test and classes with fewer than three training examples are reported as warnings because their metrics or learned decision boundaries may be unreliable.
+
+The split audit records the strategy, actual partition ratios, excluded boundary samples, per-task class counts, and sessions represented in each partition.
 
 These are image-level classifiers. They do not return bounding boxes or locations. A traffic-sign classifier with one class per image cannot represent multiple different signs in one frame; use a detector or crop individual signs for that use case. Likewise, “obstacle present” and “safe to return to the right lane” labels are only as reliable as the annotation protocol and visual evidence. A camera-only classification output must not be treated as a safety guarantee or direct permission to execute a manoeuvre. Validate the model in simulation and combine it with independent sensor, geometry, and control checks.
