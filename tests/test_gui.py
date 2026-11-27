@@ -110,8 +110,10 @@ def test_classification_annotation_reuses_last_saved_labels_and_persists_them(tm
     page.annotation_combos[1][1].setCurrentIndex(page.annotation_combos[1][1].findData("right"))
     page.save_and_next()
 
-    # The next unannotated frame inherits the last successfully saved labels.
-    assert page.current_index == 1
+    # The saved frame leaves the pending-only queue; the next pending frame
+    # takes the same queue index and inherits the last successfully saved labels.
+    assert page.current_index == 0
+    assert page.samples[0]["sample_id"] == "sample-2"
     assert [combo.currentData() for _task, combo in page.annotation_combos] == ["yes", "right"]
 
     # Moving away from unsaved edits restores the saved defaults, not those edits.
@@ -126,7 +128,11 @@ def test_classification_annotation_reuses_last_saved_labels_and_persists_them(tm
     # The last saved choice is reconstructed from samples.jsonl after restart.
     reopened = ClassificationPage(tmp_path)
     reopened._open_dataset(tmp_path)
-    assert reopened.current_index == 1
+    # Reopening a dataset with existing annotations defaults to their review
+    # queue, so only the saved frame is shown.
+    assert reopened.current_index == 0
+    assert len(reopened.samples) == 1
+    assert reopened.samples[0]["sample_id"] == "sample-1"
     assert [combo.currentData() for _task, combo in reopened.annotation_combos] == ["yes", "right"]
 
     reopened.previous_image()
