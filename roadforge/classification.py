@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -76,6 +77,9 @@ class ClassificationPage(QWidget):
         self.dataset_root = self.workspace / "classification_datasets" / "avis_engine"
         self.tasks: list[dict[str, Any]] = []
         self.samples: list[dict[str, Any]] = []
+        # Last successfully saved labels are reused as defaults for subsequent
+        # unannotated frames. Unsaved widget changes never update this cache.
+        self._last_annotation_labels: dict[str, str] = {}
         self.current_index = 0
         self.worker: ClassificationTrainingWorker | None = None
         self._build_ui()
@@ -362,6 +366,7 @@ class ClassificationPage(QWidget):
         self.tasks = config["tasks"]
         self._set_task_edits(self.tasks)
         self.samples = load_samples(self.dataset_root)
+        self._restore_last_annotation_labels()
         self.current_index = self._first_pending_index()
         self._rebuild_annotation_controls()
         self._refresh_dataset_status()
@@ -412,6 +417,40 @@ class ClassificationPage(QWidget):
             self._append_log(message)
         except Exception as exc:
             QMessageBox.warning(self, "Capture import failed", str(exc))
+
+    def _restore_last_annotation_labels(self):
+        """Restore defaults from the most recently saved, fully annotated frame."""
+        self._last_annotation_labels = {}
+        complete_rows = []
+        for index, sample in enumerate(self.samples):
+            labels = sample.get("labels")
+            if not isinstance(labels, dict) or not all(
+                labels.get(task["key"]) in task["classes"] for task in self.tasks
+            ):
+                continue
+
+            annotated_at = sample.get("annotated_at")
+            timestamp = None
+            if annotated_at:
+                try:
+                    timestamp = datetime.fromisoformat(
+                        str(annotated_at).strip().replace("Z", "+00:00")
+                    ).timestamp()
+                except (TypeError, ValueError, OverflowError, OSError):
+                    timestamp = None
+            complete_rows.append((timestamp, index, {
+                task["key"]: labels[task["key"]]
+                for task in self.tasks
+            }))
+
+        if not complete_rows:
+            return
+
+        # Prefer actual annotation timestamps. For legacy records without
+        # timestamps, use the last fully annotated row in manifest order.
+        timestamped = [row for row in complete_rows if row[0] is not None]
+        latest = max(timestamped, key=lambda row: (row[0], row[1])) if timestamped else complete_rows[-1]
+        self._last_annotation_labels = dict(latest[2])
 
     def _first_pending_index(self) -> int:
         if not self.samples or not self.tasks:
@@ -488,7 +527,11 @@ class ClassificationPage(QWidget):
             )
         labels = sample.get("labels", {})
         for task, combo in self.annotation_combos:
+            # Existing annotations always take precedence. For a new frame,
+            # reuse the last successfully saved choice for this task.
             selected = labels.get(task["key"], "")
+            if selected not in task["classes"]:
+                selected = self._last_annotation_labels.get(task["key"], "")
             if selected not in task["classes"]:
                 selected = ""
             index = combo.findData(selected)
@@ -538,6 +581,8 @@ class ClassificationPage(QWidget):
         sample = self.samples[self.current_index]
         try:
             save_sample_labels(self.dataset_root, sample["sample_id"], labels)
+            # Update defaults only after the annotation has been written safely.
+            self._last_annotation_labels = dict(labels)
             self._reload_samples()
             self._append_log(
                 f"Annotated {Path(sample['image']).name}: "
