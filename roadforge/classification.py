@@ -473,7 +473,6 @@ class ClassificationPage(QWidget):
         if not self.samples or not self.tasks:
             self.image_preview.setPixmap(QPixmap())
             self.image_preview.setText("No images in the annotation queue")
-            self.sample_details.setText("Capture frames in AVIS, then import the capture folder.")
             self.sample_details.setText("Import AVIS captures to populate the annotation queue.")
             return
         self.current_index = max(0, min(self.current_index, len(self.samples) - 1))
