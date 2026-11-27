@@ -76,7 +76,9 @@ class ClassificationPage(QWidget):
         self.capture_root = DEFAULT_CAPTURE_ROOT
         self.dataset_root = self.workspace / "classification_datasets" / "avis_engine"
         self.tasks: list[dict[str, Any]] = []
+        self.all_samples: list[dict[str, Any]] = []
         self.samples: list[dict[str, Any]] = []
+        self.annotation_filter = "annotated"
         # Last successfully saved labels are reused as defaults for subsequent
         # unannotated frames. Unsaved widget changes never update this cache.
         self._last_annotation_labels: dict[str, str] = {}
@@ -195,6 +197,16 @@ class ClassificationPage(QWidget):
         self.sample_details.setWordWrap(True)
         annotation_top.addWidget(self.annotation_counter)
         annotation_top.addStretch(1)
+        annotation_top.addWidget(QLabel("Show"))
+        self.annotation_filter_combo = QComboBox()
+        self.annotation_filter_combo.addItem("Annotated only", "annotated")
+        self.annotation_filter_combo.addItem("Needs annotation", "pending")
+        self.annotation_filter_combo.addItem("All imported", "all")
+        self.annotation_filter_combo.setToolTip(
+            "Choose which images appear in the annotation viewer. Existing labels are never deleted."
+        )
+        self.annotation_filter_combo.currentIndexChanged.connect(self._on_annotation_filter_changed)
+        annotation_top.addWidget(self.annotation_filter_combo)
         annotation_layout.addLayout(annotation_top)
         annotation_layout.addWidget(self.sample_details)
         annotation_body = QHBoxLayout()
@@ -368,12 +380,16 @@ class ClassificationPage(QWidget):
         self.dataset_root = root.resolve()
         self.tasks = config["tasks"]
         self._set_task_edits(self.tasks)
-        self.samples = load_samples(self.dataset_root)
+        self.all_samples = load_samples(self.dataset_root)
         self._restore_last_annotation_labels()
-        self.current_index = self._first_pending_index()
+        # Existing classification datasets open on their completed annotations,
+        # keeping older/unlabelled imports out of the default review queue.
+        # Fresh datasets automatically open on the frames that still need labels.
+        default_filter = "annotated" if any(
+            self._sample_is_annotated(row) for row in self.all_samples
+        ) else "pending"
         self._rebuild_annotation_controls()
-        self._refresh_dataset_status()
-        self._show_current_sample()
+        self._set_annotation_filter(default_filter, reset_index=True)
 
     def create_or_open_dataset(self):
         root = Path(self.dataset_edit.text()).expanduser()
@@ -425,7 +441,7 @@ class ClassificationPage(QWidget):
         """Restore defaults from the most recently saved, fully annotated frame."""
         self._last_annotation_labels = {}
         complete_rows = []
-        for index, sample in enumerate(self.samples):
+        for index, sample in enumerate(self.all_samples):
             labels = sample.get("labels")
             if not isinstance(labels, dict) or not all(
                 labels.get(task["key"]) in task["classes"] for task in self.tasks
@@ -498,21 +514,98 @@ class ClassificationPage(QWidget):
         )
 
     def _refresh_dataset_status(self):
-        total = len(self.samples)
-        complete = sum(1 for row in self.samples if self._sample_is_annotated(row))
+        total = len(self.all_samples)
+        complete = sum(1 for row in self.all_samples if self._sample_is_annotated(row))
         pending = total - complete
+        counts = {"annotated": complete, "pending": pending, "all": total}
+        labels = {
+            "annotated": "Annotated only",
+            "pending": "Needs annotation",
+            "all": "All imported",
+        }
+        for index, mode in enumerate(("annotated", "pending", "all")):
+            self.annotation_filter_combo.setItemText(index, f"{labels[mode]} ({counts[mode]:,})")
+        mode_label = labels.get(self.annotation_filter, "All imported").lower()
         self.dataset_status.setText(
-            f"Dataset: {self.dataset_root} · {total} images · {complete} fully annotated · {pending} pending"
+            f"Dataset: {self.dataset_root} · {total:,} images · "
+            f"{complete:,} fully annotated · {pending:,} pending"
         )
         self.annotation_counter.setText(
-            f"Dataset progress · {complete:,} / {total:,} annotated · {pending:,} remaining"
+            f"Showing {len(self.samples):,} {mode_label} images · "
+            f"{complete:,} annotated / {pending:,} awaiting labels"
         )
+
+    def _on_annotation_filter_changed(self, *_):
+        mode = str(self.annotation_filter_combo.currentData() or "all")
+        self._set_annotation_filter(mode, reset_index=True)
+
+    def _set_annotation_filter(
+        self,
+        mode: str,
+        *,
+        reset_index: bool = False,
+        preferred_sample_id: str | None = None,
+    ):
+        if mode not in {"annotated", "pending", "all"}:
+            mode = "all"
+        self.annotation_filter = mode
+
+        if mode == "annotated":
+            self.samples = [
+                row for row in self.all_samples if self._sample_is_annotated(row)
+            ]
+        elif mode == "pending":
+            self.samples = [
+                row for row in self.all_samples if not self._sample_is_annotated(row)
+            ]
+        else:
+            self.samples = list(self.all_samples)
+
+        combo_index = self.annotation_filter_combo.findData(mode)
+        if combo_index >= 0 and self.annotation_filter_combo.currentIndex() != combo_index:
+            self.annotation_filter_combo.blockSignals(True)
+            self.annotation_filter_combo.setCurrentIndex(combo_index)
+            self.annotation_filter_combo.blockSignals(False)
+
+        if preferred_sample_id:
+            matching = next(
+                (
+                    index for index, row in enumerate(self.samples)
+                    if row.get("sample_id") == preferred_sample_id
+                ),
+                None,
+            )
+            if matching is not None:
+                self.current_index = matching
+            elif not reset_index:
+                # In "Needs annotation" mode, the just-saved sample disappears
+                # from the queue; its next pending neighbour takes its index.
+                self.current_index = min(self.current_index, max(0, len(self.samples) - 1))
+        elif reset_index:
+            self.current_index = self._first_pending_index() if mode == "all" else 0
+        else:
+            self.current_index = min(self.current_index, max(0, len(self.samples) - 1))
+
+        self._refresh_dataset_status()
+        self._show_current_sample()
 
     def _show_current_sample(self):
         if not self.samples or not self.tasks:
             self.image_preview.setPixmap(QPixmap())
-            self.image_preview.setText("No images in the annotation queue")
-            self.sample_details.setText("Import AVIS captures to populate the annotation queue.")
+            if self.annotation_filter == "annotated":
+                self.image_preview.setText("No fully annotated images yet")
+                self.sample_details.setText(
+                    "Switch to 'Needs annotation' to label imported frames."
+                )
+            elif self.annotation_filter == "pending":
+                self.image_preview.setText("All imported images are annotated")
+                self.sample_details.setText(
+                    "There are no remaining frames in the annotation queue. "
+                    "Choose 'Annotated only' to review saved labels."
+                )
+            else:
+                self.image_preview.setText("No images in the annotation queue")
+                self.sample_details.setText("Import AVIS captures to populate the annotation queue.")
             return
         self.current_index = max(0, min(self.current_index, len(self.samples) - 1))
         sample = self.samples[self.current_index]
@@ -551,9 +644,18 @@ class ClassificationPage(QWidget):
         self.log.appendPlainText(str(message))
 
     def _reload_samples(self):
-        self.samples = load_samples(self.dataset_root)
-        self._refresh_dataset_status()
-        self._show_current_sample()
+        current_id = (
+            self.samples[self.current_index].get("sample_id")
+            if self.samples and 0 <= self.current_index < len(self.samples)
+            else None
+        )
+        self.all_samples = load_samples(self.dataset_root)
+        self._restore_last_annotation_labels()
+        self._set_annotation_filter(
+            self.annotation_filter,
+            reset_index=False,
+            preferred_sample_id=current_id,
+        )
 
     def previous_image(self):
         if not self.samples:
@@ -591,10 +693,13 @@ class ClassificationPage(QWidget):
                 f"Annotated {Path(sample['image']).name}: "
                 + ", ".join(f"{key}={value}" for key, value in labels.items())
             )
-            if self.current_index < len(self.samples) - 1:
-                self.current_index += 1
-            else:
-                self.current_index = self._first_pending_index()
+            # In the pending-only queue, saving removes the current frame, so
+            # the next unlabelled frame already occupies the same index.
+            if self.annotation_filter != "pending":
+                if self.current_index < len(self.samples) - 1:
+                    self.current_index += 1
+                elif self.samples:
+                    self.current_index = 0
             self._show_current_sample()
         except Exception as exc:
             QMessageBox.warning(self, "Could not save annotation", str(exc))
