@@ -77,7 +77,6 @@ class ClassificationPage(QWidget):
         self.tasks: list[dict[str, Any]] = []
         self.samples: list[dict[str, Any]] = []
         self.current_index = 0
-        self._last_annotation_labels: dict[str, str] = {}
         self.worker: ClassificationTrainingWorker | None = None
         self._build_ui()
         self._load_default_dataset()
@@ -128,16 +127,26 @@ class ClassificationPage(QWidget):
         task_box = QGroupBox("Task and class configuration")
         task_layout = QVBoxLayout(task_box)
         count_row = QHBoxLayout()
-        count_row.addWidget(QLabel("Number of tasks"))
+        count_label = QLabel("Number of tasks")
+        count_row.addWidget(count_label)
         self.task_count = QSpinBox()
         self.task_count.setRange(1, 3)
         self.task_count.setValue(2)
+        self.task_count.setFixedWidth(76)
+        self.task_count.setToolTip("Choose how many independent classification heads this dataset uses.")
         self.task_count.valueChanged.connect(self._update_task_visibility)
         count_row.addWidget(self.task_count)
         count_row.addStretch(1)
-        count_row.addWidget(QLabel("Each task is a separate classification head."))
+        task_hint = QLabel("Each task has its own name, class list and output head.")
+        task_hint.setObjectName("Muted")
+        count_row.addWidget(task_hint)
         task_layout.addLayout(count_row)
-        task_grid = QGridLayout()
+
+        self.task_grid = QGridLayout()
+        self.task_grid.setHorizontalSpacing(12)
+        self.task_grid.setVerticalSpacing(10)
+        self.task_grid.setColumnStretch(0, 1)
+        self.task_grid.setColumnStretch(1, 1)
         self.task_name_edits: list[QLineEdit] = []
         self.task_class_edits: list[QLineEdit] = []
         defaults = DEFAULT_TASKS
@@ -145,20 +154,26 @@ class ClassificationPage(QWidget):
         for index in range(3):
             group = QGroupBox(f"Task {index + 1}")
             form = QFormLayout(group)
+            form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            form.setFormAlignment(Qt.AlignmentFlag.AlignTop)
+            form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+            form.setHorizontalSpacing(14)
+            form.setVerticalSpacing(9)
             name = QLineEdit(defaults[index]["name"])
+            name.setMinimumHeight(34)
             classes = QLineEdit(", ".join(defaults[index]["classes"]))
+            classes.setMinimumHeight(34)
             classes.setPlaceholderText("class_a, class_b, class_c")
+            classes.setToolTip("Enter distinct class names separated by commas.")
             form.addRow("Task name", name)
             form.addRow("Classes", classes)
             self.task_name_edits.append(name)
             self.task_class_edits.append(classes)
             self.task_boxes.append(group)
-            task_grid.addWidget(group, index // 2, index % 2)
-        task_layout.addLayout(task_grid)
+        task_layout.addLayout(self.task_grid)
         hint = QLabel(
-            "Example: obstacle = no, yes · return to right lane = no, yes · traffic sign = "
-            "no_sign, stop, speed_limit, no_entry, turn_left, give_way. "
-            "Use a No Sign class when the image contains no traffic sign."
+            "Define labels that are visually distinguishable. Add an explicit class such as "
+            "'none' or 'no_sign' when absence is a meaningful outcome."
         )
         hint.setObjectName("Muted")
         hint.setWordWrap(True)
@@ -179,15 +194,34 @@ class ClassificationPage(QWidget):
         annotation_layout.addLayout(annotation_top)
         annotation_layout.addWidget(self.sample_details)
         annotation_body = QHBoxLayout()
+        annotation_body.setSpacing(14)
         self.image_preview = QLabel("No image selected")
         self.image_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_preview.setMinimumSize(520, 310)
+        self.image_preview.setMinimumSize(420, 300)
+        self.image_preview.setSizePolicy(self.image_preview.sizePolicy().horizontalPolicy(), self.image_preview.sizePolicy().verticalPolicy())
         self.image_preview.setStyleSheet(
             "background:#0b1118;border:1px solid #29394b;border-radius:8px;color:#9aaabc;padding:10px;"
         )
         annotation_body.addWidget(self.image_preview, 3)
-        self.label_panel = QGroupBox("Labels for this image")
-        self.label_layout = QVBoxLayout(self.label_panel)
+
+        self.label_panel = QGroupBox("Labels for current frame")
+        self.label_panel.setMinimumWidth(280)
+        label_panel_layout = QVBoxLayout(self.label_panel)
+        label_panel_layout.setContentsMargins(12, 16, 12, 12)
+        label_panel_layout.setSpacing(10)
+        label_hint = QLabel("Select one class for every task. Unlabeled frames start with no selection.")
+        label_hint.setObjectName("Muted")
+        label_hint.setWordWrap(True)
+        label_panel_layout.addWidget(label_hint)
+        label_scroll = QScrollArea()
+        label_scroll.setWidgetResizable(True)
+        label_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        label_content = QWidget()
+        self.label_layout = QVBoxLayout(label_content)
+        self.label_layout.setContentsMargins(2, 2, 2, 2)
+        self.label_layout.setSpacing(12)
+        label_scroll.setWidget(label_content)
+        label_panel_layout.addWidget(label_scroll, 1)
         self.annotation_combos: list[tuple[dict[str, Any], QComboBox]] = []
         annotation_body.addWidget(self.label_panel, 2)
         annotation_layout.addLayout(annotation_body)
@@ -264,8 +298,27 @@ class ClassificationPage(QWidget):
 
     def _update_task_visibility(self, *_):
         count = self.task_count.value()
-        for index, group in enumerate(self.task_boxes):
-            group.setVisible(index < count)
+        while self.task_grid.count():
+            item = self.task_grid.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+
+        for group in self.task_boxes:
+            group.hide()
+
+        if count == 1:
+            self.task_boxes[0].show()
+            self.task_grid.addWidget(self.task_boxes[0], 0, 0, 1, 2)
+        else:
+            for index in range(count):
+                row, column = divmod(index, 2)
+                span = 2 if count == 3 and index == 2 else 1
+                self.task_boxes[index].show()
+                self.task_grid.addWidget(self.task_boxes[index], row, column, 1, span)
+
+        self.task_grid.setColumnStretch(0, 1)
+        self.task_grid.setColumnStretch(1, 1)
 
     def _read_task_edits(self) -> list[dict[str, Any]]:
         count = self.task_count.value()
@@ -284,7 +337,7 @@ class ClassificationPage(QWidget):
             if index < len(normalized):
                 self.task_name_edits[index].setText(normalized[index]["name"])
                 self.task_class_edits[index].setText(", ".join(normalized[index]["classes"]))
-            elif index >= len(DEFAULT_TASKS):
+            else:
                 self.task_name_edits[index].clear()
                 self.task_class_edits[index].clear()
         self._update_task_visibility()
@@ -373,51 +426,30 @@ class ClassificationPage(QWidget):
                 return index
         return max(0, len(self.samples) - 1)
 
-    @staticmethod
-    def _default_annotation_selection(task: dict[str, Any]) -> str:
-        """Choose useful AVIS defaults while respecting each task's configured classes."""
-        classes = {
-            str(class_name).casefold(): str(class_name)
-            for class_name in task.get("classes", [])
-        }
-        task_name = str(task.get("name", "")).casefold()
-        if "obstacle" in task_name and "yes" in classes:
-            return classes["yes"]
-        if "right" in task_name or "lane" in task_name:
-            if "right" in classes:
-                return classes["right"]
-            if "yes" in classes:
-                return classes["yes"]
-        if "right" in classes:
-            return classes["right"]
-        return ""
-
-    def _remember_current_annotation_selection(self):
-        for task, combo in self.annotation_combos:
-            selected = str(combo.currentData() or "")
-            if selected in task["classes"]:
-                self._last_annotation_labels[task["key"]] = selected
-
     def _rebuild_annotation_controls(self):
         while self.label_layout.count():
             item = self.label_layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
                 widget.deleteLater()
+            elif item.layout() is not None:
+                nested = item.layout()
+                while nested.count():
+                    child = nested.takeAt(0)
+                    if child.widget() is not None:
+                        child.widget().deleteLater()
+
         self.annotation_combos = []
-        for task in self.tasks:
-            remembered = self._last_annotation_labels.get(task["key"], "")
-            if remembered not in task["classes"]:
-                remembered = self._default_annotation_selection(task)
-            if remembered:
-                self._last_annotation_labels[task["key"]] = remembered
-            row = QFormLayout()
+        for index, task in enumerate(self.tasks, start=1):
+            task_label = QLabel(f"Task {index} · {task['name']}")
+            task_label.setStyleSheet("font-weight: 650; color: #dce8f4; padding-top: 3px;")
             combo = QComboBox()
-            combo.addItem("— Select class —", "")
+            combo.setMinimumHeight(38)
+            combo.addItem("Select a class…", "")
             for class_name in task["classes"]:
                 combo.addItem(class_name, class_name)
-            row.addRow(task["name"], combo)
-            self.label_layout.addLayout(row)
+            self.label_layout.addWidget(task_label)
+            self.label_layout.addWidget(combo)
             self.annotation_combos.append((task, combo))
         self.label_layout.addStretch(1)
 
@@ -435,7 +467,7 @@ class ClassificationPage(QWidget):
             f"Dataset: {self.dataset_root} · {total} images · {complete} fully annotated · {pending} pending"
         )
         self.annotation_counter.setText(
-            f"{complete}/{total} images annotated · {pending} remaining"
+            f"Dataset progress · {complete:,} / {total:,} annotated · {pending:,} remaining"
         )
 
     def _show_current_sample(self):
@@ -443,7 +475,7 @@ class ClassificationPage(QWidget):
             self.image_preview.setPixmap(QPixmap())
             self.image_preview.setText("No images in the annotation queue")
             self.sample_details.setText("Capture frames in AVIS, then import the capture folder.")
-            self.annotation_counter.setText("0 images loaded")
+            self.sample_details.setText("Import AVIS captures to populate the annotation queue.")
             return
         self.current_index = max(0, min(self.current_index, len(self.samples) - 1))
         sample = self.samples[self.current_index]
@@ -463,21 +495,15 @@ class ClassificationPage(QWidget):
         for task, combo in self.annotation_combos:
             selected = labels.get(task["key"], "")
             if selected not in task["classes"]:
-                selected = self._last_annotation_labels.get(task["key"], "")
+                selected = ""
             index = combo.findData(selected)
             combo.setCurrentIndex(index if index >= 0 else 0)
-            if index >= 0 and selected:
-                self._last_annotation_labels[task["key"]] = selected
         metadata = sample.get("capture_metadata", {})
         captured = sample.get("captured_at") or metadata.get("captured_at") or "time unavailable"
         session = sample.get("session_id") or "unknown session"
         self.sample_details.setText(
-            f"Image {self.current_index + 1}/{len(self.samples)} · {image_path.name} · "
-            f"session: {session} · captured: {captured}"
-        )
-        self.annotation_counter.setText(
-            f"Image {self.current_index + 1}/{len(self.samples)} · "
-            f"{sum(1 for row in self.samples if self._sample_is_annotated(row))}/{len(self.samples)} complete"
+            f"Frame {self.current_index + 1:,} of {len(self.samples):,} · {image_path.name}\n"
+            f"Session: {session} · Captured: {captured}"
         )
 
     def _append_log(self, message: str):
@@ -491,14 +517,12 @@ class ClassificationPage(QWidget):
     def previous_image(self):
         if not self.samples:
             return
-        self._remember_current_annotation_selection()
         self.current_index = max(0, self.current_index - 1)
         self._show_current_sample()
 
     def next_image(self):
         if not self.samples:
             return
-        self._remember_current_annotation_selection()
         self.current_index = min(len(self.samples) - 1, self.current_index + 1)
         self._show_current_sample()
 
@@ -519,7 +543,6 @@ class ClassificationPage(QWidget):
         sample = self.samples[self.current_index]
         try:
             save_sample_labels(self.dataset_root, sample["sample_id"], labels)
-            self._last_annotation_labels.update(labels)
             self._reload_samples()
             self._append_log(
                 f"Annotated {Path(sample['image']).name}: "
