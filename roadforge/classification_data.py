@@ -320,7 +320,7 @@ def _temporal_split(
         if has_complete_timestamps:
             left_time = _capture_timestamp(left)
             right_time = _capture_timestamp(right)
-            if left_time is not None and right_time is not None and right_time > left_time:
+            if left_time is not None and right_time is not None and right_time >= left_time:
                 midpoint = (left_time + right_time) / 2.0
                 radius = max(0.0, float(temporal_gap_seconds)) / 2.0
                 for position, row in enumerate(ordered):
@@ -352,14 +352,31 @@ def _temporal_split(
             if position not in excluded_indices
         ],
     }
+    # Legacy datasets may contain repeated image hashes even though the current
+    # importer skips them. Keep only the first occurrence, in the earliest split,
+    # so identical pixels can never leak into validation or test.
+    seen_hashes: set[str] = set()
+    duplicate_rows = 0
+    for part in ("train", "val", "test"):
+        unique_rows = []
+        for row in partitions[part]:
+            digest = str(row.get("sha256") or row.get("content_hash") or "").strip().lower()
+            if digest and digest in seen_hashes:
+                duplicate_rows += 1
+                continue
+            if digest:
+                seen_hashes.add(digest)
+            unique_rows.append(row)
+        partitions[part] = unique_rows
+
     if any(not partitions[name] for name in ("train", "val", "test")):
         raise ValueError(
             "A leakage-aware temporal split cannot create non-empty train, validation and test sets "
-            "after applying the temporal embargo. Collect more annotated frames across a longer "
-            "capture period or add independent AVIS sessions; RoadForge will not silently fall back "
-            "to a random frame split."
+            "after applying the temporal embargo and removing duplicate images. Collect more "
+            "annotated frames across a longer capture period or add independent AVIS sessions; "
+            "RoadForge will not silently fall back to a random frame split."
         )
-    return partitions, len(excluded_indices)
+    return partitions, len(excluded_indices) + duplicate_rows
 
 
 def _build_classification_split(
