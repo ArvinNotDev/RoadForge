@@ -66,13 +66,13 @@ def test_worker_runs_off_main_thread_and_delivers_errors():
 
 
 
-def test_classification_annotation_defaults_to_yes_right_and_remembers_last_choice(tmp_path):
+def test_classification_annotation_requires_explicit_label_and_never_carries_forward(tmp_path):
     app = QApplication.instance() or QApplication([])
     page = ClassificationPage(tmp_path)
     page.dataset_root = tmp_path
     page.tasks = validate_tasks([
         {"name": "Obstacle ahead", "classes": ["no", "yes"]},
-        {"name": "Current lane", "classes": ["left", "right"]},
+        {"name": "Sign", "classes": ["right", "left", "straight", "stop", "90r", "90l"]},
     ])
     page._rebuild_annotation_controls()
 
@@ -86,13 +86,44 @@ def test_classification_annotation_defaults_to_yes_right_and_remembers_last_choi
         {"sample_id": "sample-2", "image": "second.png", "labels": {}, "capture_metadata": {}},
     ]
     page.current_index = 0
+    page._refresh_dataset_status()
     page._show_current_sample()
-    assert [combo.currentData() for _task, combo in page.annotation_combos] == ["yes", "right"]
 
-    page.annotation_combos[0][1].setCurrentIndex(page.annotation_combos[0][1].findData("no"))
-    page.annotation_combos[1][1].setCurrentIndex(page.annotation_combos[1][1].findData("left"))
+    # No class (including "right") may be silently selected for a new image.
+    assert [combo.currentData() for _task, combo in page.annotation_combos] == ["", ""]
+    assert "Dataset progress" in page.annotation_counter.text()
+    assert "Frame 1 of 2" in page.sample_details.text()
+
+    page.annotation_combos[0][1].setCurrentIndex(page.annotation_combos[0][1].findData("yes"))
+    page.annotation_combos[1][1].setCurrentIndex(page.annotation_combos[1][1].findData("right"))
     page.next_image()
-    assert [combo.currentData() for _task, combo in page.annotation_combos] == ["no", "left"]
+    assert [combo.currentData() for _task, combo in page.annotation_combos] == ["", ""]
+
+    page.previous_image()
+    assert [combo.currentData() for _task, combo in page.annotation_combos] == ["", ""]
+
+    # A previously saved annotation is displayed, but never copied to another frame.
+    page.samples[1]["labels"] = {"obstacle_ahead": "no", "sign": "straight"}
+    page.current_index = 1
+    page._show_current_sample()
+    assert [combo.currentData() for _task, combo in page.annotation_combos] == ["no", "straight"]
+
+    page.close()
+    app.processEvents()
+
+
+def test_classification_task_layout_expands_single_task_and_supports_three_tasks(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    page = ClassificationPage(tmp_path)
+
+    page.task_count.setValue(1)
+    assert page.task_grid.count() == 1
+    assert page.task_grid.itemAtPosition(0, 0).widget() is page.task_boxes[0]
+    assert page.task_grid.itemAtPosition(0, 1).widget() is page.task_boxes[0]
+
+    page.task_count.setValue(3)
+    assert page.task_grid.count() == 3
+    assert all(not page.task_boxes[index].isHidden() for index in range(3))
 
     page.close()
     app.processEvents()
