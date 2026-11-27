@@ -9,7 +9,7 @@ from PySide6.QtTest import QSignalSpy
 from PySide6.QtWidgets import QApplication
 
 from roadforge.classification import ClassificationPage
-from roadforge.classification_data import validate_tasks
+from roadforge.classification_data import ensure_dataset, validate_tasks
 from roadforge.core.workers import OperationWorker
 from roadforge.main import MainWindow
 
@@ -66,51 +66,73 @@ def test_worker_runs_off_main_thread_and_delivers_errors():
 
 
 
-def test_classification_annotation_requires_explicit_label_and_never_carries_forward(tmp_path):
+def test_classification_annotation_reuses_last_saved_labels_and_persists_them(tmp_path):
+    import json
+
     app = QApplication.instance() or QApplication([])
-    page = ClassificationPage(tmp_path)
-    page.dataset_root = tmp_path
-    page.tasks = validate_tasks([
+    tasks = validate_tasks([
         {"name": "Obstacle ahead", "classes": ["no", "yes"]},
         {"name": "Sign", "classes": ["right", "left", "straight", "stop", "90r", "90l"]},
     ])
-    page._rebuild_annotation_controls()
-
-    for filename in ("first.png", "second.png"):
+    ensure_dataset(tmp_path, tasks)
+    image_dir = tmp_path / "images"
+    samples = []
+    for index, filename in enumerate(("first.png", "second.png")):
         image = QImage(32, 24, QImage.Format.Format_RGB32)
         image.fill(Qt.GlobalColor.black)
-        assert image.save(str(tmp_path / filename))
+        assert image.save(str(image_dir / filename))
+        samples.append({
+            "sample_id": f"sample-{index + 1}",
+            "image": f"images/{filename}",
+            "sha256": f"hash-{index + 1}",
+            "session_id": "test-session",
+            "captured_at": f"2026-11-27T10:0{index}:00+03:30",
+            "labels": {},
+        })
+    (tmp_path / "samples.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in samples),
+        encoding="utf-8",
+    )
 
-    page.samples = [
-        {"sample_id": "sample-1", "image": "first.png", "labels": {}, "capture_metadata": {}},
-        {"sample_id": "sample-2", "image": "second.png", "labels": {}, "capture_metadata": {}},
-    ]
-    page.current_index = 0
-    page._refresh_dataset_status()
+    page = ClassificationPage(tmp_path)
+    page._open_dataset(tmp_path)
     page._show_current_sample()
 
-    # No class (including "right") may be silently selected for a new image.
+    # Unsaved choices must not become the default for the next frame.
     assert [combo.currentData() for _task, combo in page.annotation_combos] == ["", ""]
-    assert "Dataset progress" in page.annotation_counter.text()
-    assert "Frame 1 of 2" in page.sample_details.text()
-
     page.annotation_combos[0][1].setCurrentIndex(page.annotation_combos[0][1].findData("yes"))
     page.annotation_combos[1][1].setCurrentIndex(page.annotation_combos[1][1].findData("right"))
     page.next_image()
     assert [combo.currentData() for _task, combo in page.annotation_combos] == ["", ""]
 
     page.previous_image()
-    assert [combo.currentData() for _task, combo in page.annotation_combos] == ["", ""]
+    page.annotation_combos[0][1].setCurrentIndex(page.annotation_combos[0][1].findData("yes"))
+    page.annotation_combos[1][1].setCurrentIndex(page.annotation_combos[1][1].findData("right"))
+    page.save_and_next()
 
-    # A previously saved annotation is displayed, but never copied to another frame.
-    page.samples[1]["labels"] = {"obstacle_ahead": "no", "sign": "straight"}
-    page.current_index = 1
-    page._show_current_sample()
-    assert [combo.currentData() for _task, combo in page.annotation_combos] == ["no", "straight"]
+    # The next unannotated frame inherits the last successfully saved labels.
+    assert page.current_index == 1
+    assert [combo.currentData() for _task, combo in page.annotation_combos] == ["yes", "right"]
 
+    # Moving away from unsaved edits restores the saved defaults, not those edits.
+    page.annotation_combos[0][1].setCurrentIndex(page.annotation_combos[0][1].findData("no"))
+    page.annotation_combos[1][1].setCurrentIndex(page.annotation_combos[1][1].findData("left"))
+    page.previous_image()
+    page.next_image()
+    assert [combo.currentData() for _task, combo in page.annotation_combos] == ["yes", "right"]
     page.close()
     app.processEvents()
 
+    # The last saved choice is reconstructed from samples.jsonl after restart.
+    reopened = ClassificationPage(tmp_path)
+    reopened._open_dataset(tmp_path)
+    assert reopened.current_index == 1
+    assert [combo.currentData() for _task, combo in reopened.annotation_combos] == ["yes", "right"]
+
+    reopened.previous_image()
+    assert [combo.currentData() for _task, combo in reopened.annotation_combos] == ["yes", "right"]
+    reopened.close()
+    app.processEvents()
 
 def test_classification_task_layout_expands_single_task_and_supports_three_tasks(tmp_path):
     app = QApplication.instance() or QApplication([])
