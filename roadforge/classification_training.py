@@ -17,10 +17,10 @@ from .classification_data import (
 IMAGE_SIZE = 224
 IMAGE_MEAN = (0.485, 0.456, 0.406)
 IMAGE_STD = (0.229, 0.224, 0.225)
-DROPOUT_RATE = 0.15
-LABEL_SMOOTHING = 0.0
-WEIGHT_DECAY = 1e-4
-EARLY_STOPPING_PATIENCE = 16
+DROPOUT_RATE = 0.30
+LABEL_SMOOTHING = 0.02
+WEIGHT_DECAY = 5e-4
+EARLY_STOPPING_PATIENCE = 8
 OVERFIT_GAP_THRESHOLD = 0.20
 
 
@@ -203,7 +203,7 @@ def train_multitask_classifier(
     dataset_root: Path | str,
     workspace: Path | str,
     backbone: str,
-    epochs: int = 80,
+    epochs: int = 30,
     batch_size: int = 16,
     learning_rate: float = 1e-4,
     pretrained: bool = True,
@@ -306,7 +306,7 @@ def train_multitask_classifier(
         optimizer,
         mode="max",
         factor=0.5,
-        patience=4,
+        patience=2,
         threshold=1e-3,
     )
 
