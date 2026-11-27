@@ -642,12 +642,24 @@ def analyze_classification_split(
         })
         for part, values in split.items()
     }
+    actual_ratios = {part: counts[part] / total for part in counts}
+    for part in ("train", "val", "test"):
+        if abs(actual_ratios[part] - 0.8 if part == "train" else actual_ratios[part] - 0.1) > 0.05:
+            requested_ratio = 0.8 if part == "train" else 0.1
+            warnings.append(
+                f"The {part} split is {actual_ratios[part]:.1%}, notably different from the "
+                f"requested {requested_ratio:.0%}; indivisible session groups can cause this."
+            )
+        if part in ("val", "test") and counts[part] < 5:
+            warnings.append(
+                f"The {part} split has only {counts[part]} sample(s); evaluation metrics may be unstable."
+            )
     audit = {
         "strategy": strategy,
         "seed": int(seed),
         "requested_ratios": {"train": 0.8, "val": 0.1, "test": 0.1},
         "counts": counts,
-        "actual_ratios": {part: counts[part] / total for part in counts},
+        "actual_ratios": actual_ratios,
         "excluded_near_boundaries": int(excluded),
         "class_distribution": class_distribution,
         "session_distribution": session_distribution,
