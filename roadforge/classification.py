@@ -618,6 +618,11 @@ class ClassificationPage(QWidget):
                 f"Excluded near split boundaries: {audit['excluded_near_boundaries']}",
                 "",
             ]
+            shared_sessions = audit.get("shared_sessions_across_splits", {})
+            if shared_sessions:
+                lines.extend(["", f"Sessions shared across partitions: {len(shared_sessions)}"])
+                for session, partitions in shared_sessions.items():
+                    lines.append(f"  {session}: {', '.join(partitions)}")
             for part in ("train", "val", "test"):
                 ratio = audit["actual_ratios"][part]
                 sessions = len(audit["session_distribution"][part])
