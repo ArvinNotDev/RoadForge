@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import random
 from collections import Counter
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -24,19 +25,136 @@ EARLY_STOPPING_PATIENCE = 8
 OVERFIT_GAP_THRESHOLD = 0.20
 
 
-def build_multitask_classifier(backbone: str, tasks: list[dict[str, Any]], pretrained: bool = True):
+
+def _load_resnet18_initial_weights(base, checkpoint_path: Path | str) -> dict[str, Any]:
+    """Load a local ResNet18 backbone from a weights-only PyTorch checkpoint."""
+    import hashlib
+    import torch
+
+    source = Path(checkpoint_path).expanduser().resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f"ResNet18 checkpoint does not exist: {source}")
+    try:
+        payload = torch.load(source, map_location="cpu", weights_only=True)
+    except TypeError:
+        payload = torch.load(source, map_location="cpu")
+    except Exception as exc:
+        raise ValueError(
+            "Could not safely read this .pt file as a weights checkpoint. "
+            "Use a ResNet18 state_dict or a checkpoint containing state_dict/model_state_dict."
+        ) from exc
+
+    wrappers = ("state_dict", "model_state_dict", "model", "backbone", "weights", "net", "network", "ema")
+    for _ in range(6):
+        if not isinstance(payload, Mapping):
+            break
+        nested = next(
+            (payload.get(key) for key in wrappers if isinstance(payload.get(key), Mapping)),
+            None,
+        )
+        if nested is None:
+            break
+        payload = nested
+
+    if not isinstance(payload, Mapping):
+        raise ValueError("The selected .pt file does not contain a ResNet18 state dictionary.")
+
+    expected = base.state_dict()
+    prefixes = (
+        "module.", "_orig_mod.", "model.", "network.", "net.",
+        "backbone.", "encoder.", "resnet.", "resnet18.", "feature_extractor.",
+    )
+    compatible: dict[str, Any] = {}
+    shape_mismatches: list[str] = []
+    for raw_key, value in payload.items():
+        if not torch.is_tensor(value):
+            continue
+        key = str(raw_key)
+        changed = True
+        while changed:
+            changed = False
+            for prefix in prefixes:
+                if key.startswith(prefix):
+                    key = key[len(prefix):]
+                    changed = True
+                    break
+        if key.startswith("fc.") or key.startswith("classifier.") or key.startswith("heads."):
+            continue
+        if key not in expected:
+            continue
+        if tuple(value.shape) != tuple(expected[key].shape):
+            shape_mismatches.append(
+                f"{key}: checkpoint {tuple(value.shape)} != ResNet18 {tuple(expected[key].shape)}"
+            )
+            continue
+        compatible[key] = value
+
+    backbone_keys = [key for key in expected if not key.startswith("fc.")]
+    required_keys = (
+        "conv1.weight",
+        "layer1.0.conv1.weight",
+        "layer2.0.conv1.weight",
+        "layer3.0.conv1.weight",
+        "layer4.0.conv1.weight",
+    )
+    missing_required = [key for key in required_keys if key not in compatible]
+    minimum_keys = (len(backbone_keys) * 4 + 4) // 5
+    if missing_required or len(compatible) < minimum_keys:
+        details = (
+            f"Loaded {len(compatible)} of {len(backbone_keys)} ResNet18 backbone tensors; "
+            f"at least {minimum_keys} are required."
+        )
+        if missing_required:
+            details += " Missing core layers: " + ", ".join(missing_required) + "."
+        if shape_mismatches:
+            details += " Shape mismatches: " + "; ".join(shape_mismatches[:5]) + "."
+        raise ValueError(
+            "The selected checkpoint is not a compatible ResNet18 model. " + details
+        )
+
+    base.load_state_dict(compatible, strict=False)
+    digest = hashlib.sha256()
+    with source.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {
+        "source": "local_resnet18_pt",
+        "checkpoint_name": source.name,
+        "checkpoint_path": str(source),
+        "checkpoint_sha256": digest.hexdigest(),
+        "loaded_backbone_tensors": len(compatible),
+        "available_backbone_tensors": len(backbone_keys),
+    }
+
+
+def build_multitask_classifier(
+    backbone: str,
+    tasks: list[dict[str, Any]],
+    pretrained: bool = True,
+    initial_weights_path: Path | str | None = None,
+):
     import torch.nn as nn
     from torchvision import models
 
     selected = str(backbone).strip().lower()
+    initialization_info: dict[str, Any]
     if selected == "resnet18":
-        weights = models.ResNet18_Weights.DEFAULT if pretrained else None
+        if initial_weights_path and pretrained:
+            raise ValueError("Choose either local ResNet18 .pt weights or ImageNet initialization, not both.")
+        weights = models.ResNet18_Weights.DEFAULT if pretrained and not initial_weights_path else None
         base = models.resnet18(weights=weights)
+        if initial_weights_path:
+            initialization_info = _load_resnet18_initial_weights(base, initial_weights_path)
+        else:
+            initialization_info = {"source": "imagenet" if pretrained else "random"}
         feature_dim = int(base.fc.in_features)
         base.fc = nn.Identity()
     elif selected == "efficientnet_b0":
+        if initial_weights_path:
+            raise ValueError("Local .pt fine-tuning is currently supported only for ResNet18.")
         weights = models.EfficientNet_B0_Weights.DEFAULT if pretrained else None
         base = models.efficientnet_b0(weights=weights)
+        initialization_info = {"source": "imagenet" if pretrained else "random"}
         feature_dim = int(base.classifier[-1].in_features)
         base.classifier = nn.Identity()
     else:
@@ -57,7 +175,9 @@ def build_multitask_classifier(backbone: str, tasks: list[dict[str, Any]], pretr
             features = self.dropout(self.feature_extractor(images))
             return [head(features) for head in self.heads]
 
-    return MultiTaskClassifier()
+    model = MultiTaskClassifier()
+    model.initialization_info = initialization_info
+    return model
 
 
 class _ClassificationImageDataset:
@@ -209,6 +329,7 @@ def train_multitask_classifier(
     pretrained: bool = True,
     seed: int = 42,
     progress: Callable[[dict[str, Any]], None] | None = None,
+    initial_weights_path: Path | str | None = None,
 ) -> dict[str, Any]:
     import numpy as np
     import torch
@@ -273,10 +394,14 @@ def train_multitask_classifier(
     )
 
     selected_backbone = str(backbone).strip().lower()
-    model = build_multitask_classifier(selected_backbone, tasks, pretrained=pretrained).to(
-        torch.device("cuda" if use_cuda else "cpu")
-    )
+    model = build_multitask_classifier(
+        selected_backbone,
+        tasks,
+        pretrained=pretrained,
+        initial_weights_path=initial_weights_path,
+    ).to(torch.device("cuda" if use_cuda else "cpu"))
     device = next(model.parameters()).device
+    initialization_info = dict(getattr(model, "initialization_info", {"source": "unknown"}))
 
     task_class_weights = []
     low_support_warnings = []
@@ -332,6 +457,7 @@ def train_multitask_classifier(
             "input_size": IMAGE_SIZE,
             "mean": IMAGE_MEAN,
             "std": IMAGE_STD,
+            "initialization": initialization_info,
             "state_dict": model.state_dict(),
             "epoch": epoch,
             "selection_metric": "validation_macro_f1",
@@ -346,7 +472,8 @@ def train_multitask_classifier(
             "message": (
                 f"Training {selected_backbone} on {device}; "
                 f"{len(split['train'])} train / {len(split['val'])} validation / "
-                f"{len(split['test'])} test; split={split_audit['strategy']}."
+                f"{len(split['test'])} test; split={split_audit['strategy']}; "
+                f"initialization={initialization_info.get('source', 'unknown')}."
             ),
             "warning": warning_text,
             "split_audit": split_audit,
@@ -467,6 +594,7 @@ def train_multitask_classifier(
         "backbone": selected_backbone,
         "device": str(device),
         "pretrained": bool(pretrained),
+        "initialization": initialization_info,
         "dataset": str(dataset_root),
         "run_dir": str(run_dir),
         "best_checkpoint": str(run_dir / "best.pt"),
@@ -513,6 +641,7 @@ def train_multitask_classifier(
                 "learning_rate_backbone": float(learning_rate),
                 "learning_rate_heads": float(learning_rate) * 5.0,
                 "pretrained": bool(pretrained),
+                "initialization": initialization_info,
                 "seed": int(seed),
                 "input_size": IMAGE_SIZE,
                 "tasks": tasks,

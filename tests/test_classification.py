@@ -269,6 +269,67 @@ def test_supported_backbones_produce_one_output_per_task(backbone):
 
 
 
+
+def test_resnet18_local_pt_checkpoint_initializes_backbone_and_ignores_old_head(tmp_path):
+    torch = pytest.importorskip("torch")
+    torchvision = pytest.importorskip("torchvision")
+    from roadforge.classification_training import build_multitask_classifier
+
+    source = torchvision.models.resnet18(weights=None)
+    state = source.state_dict()
+    state["conv1.weight"] = torch.full_like(state["conv1.weight"], 0.125)
+    state["fc.weight"] = torch.randn(7, source.fc.in_features)
+    state["fc.bias"] = torch.randn(7)
+    checkpoint = tmp_path / "prepared_resnet18.pt"
+    torch.save({"state_dict": {f"module.backbone.{key}": value for key, value in state.items()}}, checkpoint)
+
+    tasks = [{"key": "sign", "name": "Sign", "classes": ["right", "left", "straight"]}]
+    model = build_multitask_classifier(
+        "resnet18", tasks, pretrained=False, initial_weights_path=checkpoint
+    )
+
+    torch.testing.assert_close(
+        model.feature_extractor.conv1.weight,
+        torch.full_like(model.feature_extractor.conv1.weight, 0.125),
+    )
+    assert model.heads[0].out_features == 3
+    assert model.initialization_info["source"] == "local_resnet18_pt"
+    assert model.initialization_info["checkpoint_sha256"]
+    assert model.initialization_info["loaded_backbone_tensors"] > 100
+
+
+def test_resnet18_local_pt_checkpoint_rejects_non_resnet_weights(tmp_path):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("torchvision")
+    from roadforge.classification_training import build_multitask_classifier
+
+    checkpoint = tmp_path / "not_resnet18.pt"
+    torch.save({"state_dict": {"classifier.weight": torch.ones(3, 4)}}, checkpoint)
+    with pytest.raises(ValueError, match="not a compatible ResNet18"):
+        build_multitask_classifier(
+            "resnet18",
+            [{"key": "sign", "name": "Sign", "classes": ["right", "left"]}],
+            pretrained=False,
+            initial_weights_path=checkpoint,
+        )
+
+
+def test_local_pt_initialization_is_rejected_for_efficientnet(tmp_path):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("torchvision")
+    from roadforge.classification_training import build_multitask_classifier
+
+    checkpoint = tmp_path / "resnet18.pt"
+    torch.save({"state_dict": {}}, checkpoint)
+    with pytest.raises(ValueError, match="only for ResNet18"):
+        build_multitask_classifier(
+            "efficientnet_b0",
+            [{"key": "sign", "name": "Sign", "classes": ["right", "left"]}],
+            pretrained=False,
+            initial_weights_path=checkpoint,
+        )
+
+
 def test_resnet18_multitask_checkpoint_exports_to_onnx(tmp_path):
     torch = pytest.importorskip("torch")
     pytest.importorskip("torchvision")

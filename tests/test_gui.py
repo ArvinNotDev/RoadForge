@@ -210,6 +210,32 @@ def test_classification_view_defaults_to_existing_annotations_and_keeps_pending_
     app.processEvents()
 
 
+
+def test_classification_local_resnet18_finetune_controls_are_safe(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    page = ClassificationPage(tmp_path)
+
+    assert page.pretrained_check.isChecked()
+    assert page.pretrained_check.isEnabled()
+    assert not page.local_resnet18_check.isChecked()
+    assert not page.resnet18_weights_edit.isEnabled()
+
+    page.resnet18_weights_edit.setText(str(tmp_path / "prepared.pt"))
+    page.local_resnet18_check.setChecked(True)
+    assert not page.pretrained_check.isEnabled()
+    assert page.resnet18_weights_edit.isEnabled()
+    assert page.resnet18_weights_button.isEnabled()
+
+    page.backbone_combo.setCurrentIndex(page.backbone_combo.findData("efficientnet_b0"))
+    assert not page.local_resnet18_check.isChecked()
+    assert not page.local_resnet18_check.isEnabled()
+    assert page.pretrained_check.isEnabled()
+    assert not page.resnet18_weights_edit.isEnabled()
+
+    page.close()
+    app.processEvents()
+
+
 def test_classification_task_layout_expands_single_task_and_supports_three_tasks(tmp_path):
     app = QApplication.instance() or QApplication([])
     page = ClassificationPage(tmp_path)

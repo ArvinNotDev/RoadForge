@@ -48,18 +48,23 @@ class ClassificationTrainingWorker(QThread):
     completed = Signal(dict)
     failed = Signal(str)
 
-    def __init__(self, dataset_root, workspace, backbone, epochs, batch_size, learning_rate, pretrained):
+    def __init__(
+        self, dataset_root, workspace, backbone, epochs, batch_size,
+        learning_rate, pretrained, initial_weights_path=None,
+    ):
         super().__init__()
         self.args = (
             dataset_root, workspace, backbone, epochs, batch_size,
             learning_rate, pretrained,
         )
+        self.initial_weights_path = initial_weights_path
 
     def run(self):
         try:
             report = train_multitask_classifier(
                 *self.args,
                 progress=self.progress.emit,
+                initial_weights_path=self.initial_weights_path,
             )
             self.completed.emit(report)
         except Exception as exc:
@@ -269,6 +274,18 @@ class ClassificationPage(QWidget):
         self.lr_spin.setValue(0.0001)
         self.pretrained_check = QCheckBox("Initialize from ImageNet pretrained weights")
         self.pretrained_check.setChecked(True)
+        self.local_resnet18_check = QCheckBox("Fine-tune from a local ResNet18 .pt checkpoint")
+        self.local_resnet18_check.setToolTip(
+            "Load compatible ResNet18 backbone tensors from a local .pt/.pth state_dict. "
+            "Task-specific output heads are created fresh for the current dataset."
+        )
+        self.resnet18_weights_edit = QLineEdit()
+        self.resnet18_weights_edit.setPlaceholderText("Select a ResNet18 .pt / .pth checkpoint…")
+        self.resnet18_weights_edit.setEnabled(False)
+        self.resnet18_weights_button = self._button("Browse .pt…", self._browse_resnet18_weights)
+        self.resnet18_weights_button.setEnabled(False)
+        self.local_resnet18_check.toggled.connect(self._update_initialization_controls)
+        self.backbone_combo.currentIndexChanged.connect(self._update_initialization_controls)
         training_layout.addWidget(QLabel("Backbone"), 0, 0)
         training_layout.addWidget(self.backbone_combo, 0, 1)
         training_layout.addWidget(QLabel("Epochs"), 0, 2)
@@ -280,18 +297,22 @@ class ClassificationPage(QWidget):
         training_layout.addWidget(self.pretrained_check, 2, 0, 1, 3)
         self.train_button = self._button("Train selected backbone", self.start_training, primary=True)
         training_layout.addWidget(self.train_button, 2, 3)
+        training_layout.addWidget(self.local_resnet18_check, 3, 0, 1, 4)
+        training_layout.addWidget(self.resnet18_weights_edit, 4, 0, 1, 3)
+        training_layout.addWidget(self.resnet18_weights_button, 4, 3)
         self.training_progress = QProgressBar()
         self.training_progress.setRange(0, 100)
         self.training_progress.setValue(0)
-        training_layout.addWidget(self.training_progress, 3, 0, 1, 4)
+        training_layout.addWidget(self.training_progress, 5, 0, 1, 4)
         self.training_status = QLabel("Training has not started.")
         self.training_status.setObjectName("Muted")
         self.training_status.setWordWrap(True)
-        training_layout.addWidget(self.training_status, 4, 0, 1, 4)
+        training_layout.addWidget(self.training_status, 6, 0, 1, 4)
         self.preview_split_button = self._button(
             "Preview train / validation / test split", self.preview_training_split
         )
-        training_layout.addWidget(self.preview_split_button, 5, 0, 1, 4)
+        training_layout.addWidget(self.preview_split_button, 7, 0, 1, 4)
+        self._update_initialization_controls()
         layout.addWidget(training_box)
 
         self.log = QPlainTextEdit()
@@ -356,6 +377,27 @@ class ClassificationPage(QWidget):
                 self.task_name_edits[index].clear()
                 self.task_class_edits[index].clear()
         self._update_task_visibility()
+
+    def _browse_resnet18_weights(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select a prepared ResNet18 checkpoint",
+            self.resnet18_weights_edit.text() or str(self.workspace),
+            "PyTorch checkpoints (*.pt *.pth);;All files (*)",
+        )
+        if path:
+            self.resnet18_weights_edit.setText(path)
+            self.local_resnet18_check.setChecked(True)
+
+    def _update_initialization_controls(self, *_):
+        is_resnet18 = self.backbone_combo.currentData() == "resnet18"
+        if self.local_resnet18_check.isChecked() and not is_resnet18:
+            self.local_resnet18_check.setChecked(False)
+        use_local = is_resnet18 and self.local_resnet18_check.isChecked()
+        self.local_resnet18_check.setEnabled(is_resnet18)
+        self.resnet18_weights_edit.setEnabled(use_local)
+        self.resnet18_weights_button.setEnabled(is_resnet18)
+        self.pretrained_check.setEnabled(not use_local)
 
     def _browse_capture(self):
         folder = QFileDialog.getExistingDirectory(self, "Select AVIS capture folder", self.capture_edit.text())
@@ -770,6 +812,23 @@ class ClassificationPage(QWidget):
         if not (root / "dataset.json").is_file():
             QMessageBox.warning(self, "Dataset required", "Create or open a classification dataset first.")
             return
+        initial_weights_path = None
+        if self.local_resnet18_check.isChecked():
+            if self.backbone_combo.currentData() != "resnet18":
+                QMessageBox.warning(
+                    self, "ResNet18 required",
+                    "Local .pt fine-tuning is currently available only with the ResNet18 backbone.",
+                )
+                return
+            checkpoint = Path(self.resnet18_weights_edit.text().strip()).expanduser()
+            if not checkpoint.is_file() or checkpoint.suffix.lower() not in {".pt", ".pth"}:
+                QMessageBox.warning(
+                    self, "ResNet18 checkpoint required",
+                    "Select an existing ResNet18 .pt or .pth weights checkpoint.",
+                )
+                return
+            initial_weights_path = str(checkpoint.resolve())
+
         try:
             rows = annotated_samples(root)
             if len(rows) < 3:
@@ -791,7 +850,10 @@ class ClassificationPage(QWidget):
         self.train_button.setEnabled(False)
         self.preview_split_button.setEnabled(False)
         self.training_progress.setValue(0)
-        self.training_status.setText("Initializing model and loading pretrained weights…")
+        if initial_weights_path:
+            self.training_status.setText("Loading the selected ResNet18 .pt backbone and preparing new task heads…")
+        else:
+            self.training_status.setText("Initializing model and loading pretrained weights…")
         self.worker = ClassificationTrainingWorker(
             self.dataset_root,
             self.workspace,
@@ -799,13 +861,21 @@ class ClassificationPage(QWidget):
             self.epochs_spin.value(),
             self.batch_spin.value(),
             self.lr_spin.value(),
-            self.pretrained_check.isChecked(),
+            self.pretrained_check.isChecked() and not bool(initial_weights_path),
+            initial_weights_path,
         )
         self.worker.progress.connect(self._training_progress)
         self.worker.completed.connect(self._training_completed)
         self.worker.failed.connect(self._training_failed)
         self.worker.start()
-        self._append_log(f"Started {self.backbone_combo.currentText()} multi-task training.")
+        self._append_log(
+            f"Started {self.backbone_combo.currentText()} multi-task training; "
+            + (
+                f"initialization checkpoint: {initial_weights_path}"
+                if initial_weights_path else
+                f"initialization: {'ImageNet' if self.pretrained_check.isChecked() else 'random'}"
+            )
+        )
 
     def _training_progress(self, payload: dict[str, Any]):
         state = payload.get("state")

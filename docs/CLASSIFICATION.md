@@ -57,7 +57,7 @@ Choose either:
 - **ResNet18** — compact residual feature extractor with a 512-feature shared representation.
 - **EfficientNet-B0** — compact compound-scaled feature extractor with a 1280-feature shared representation.
 
-Both use a shared backbone, a 0.30 dropout layer, and one independent classification head per task. ImageNet pretrained weights are enabled by default and are recommended for small datasets; the first use may download the torchvision checkpoint. The input is resized to 224×224 and normalized with ImageNet statistics. Training augmentation uses restrained color jitter and small affine changes. Horizontal flipping is deliberately avoided because it can reverse the meaning of road signs and left/right driving manoeuvres.
+Both use a shared backbone, a 0.30 dropout layer, and one independent classification head per task. ImageNet pretrained weights are enabled by default and are recommended as a starting point; the first use may download the torchvision checkpoint. For ResNet18, you can instead enable **Fine-tune from a local ResNet18 .pt checkpoint** and select a prepared PyTorch state_dict. RoadForge loads the compatible ResNet18 backbone tensors, ignores the source model's final classifier, and creates fresh output heads for the tasks configured in the current dataset. The local file must be a raw ResNet18 state_dict or a checkpoint containing a common wrapper such as `state_dict` or `model_state_dict`; it must contain matching ResNet18 backbone layers. Local checkpoint initialization and ImageNet initialization are mutually exclusive. This option is currently ResNet18-only. The input is resized to 224×224 and normalized with ImageNet statistics. Training augmentation uses restrained color jitter and small affine changes. Horizontal flipping is deliberately avoided because it can reverse the meaning of road signs and left/right driving manoeuvres.
 
 Training uses inverse-frequency class weights, light label smoothing, AdamW weight decay, gradient clipping, and a learning rate five times higher for the task heads than for the backbone. The learning-rate scheduler and early stopping monitor mean validation macro-F1 rather than raw accuracy, making model selection less sensitive to majority classes. Early stopping uses a patience of eight epochs. The training loop also tracks the train/validation macro-F1 gap and reports a persistent gap above 0.20 as a possible overfitting warning. These controls reduce overfitting risk but cannot replace more diverse, correctly annotated data.
 
@@ -73,7 +73,7 @@ Outputs are stored under:
     ├── training_config.json
     └── training_report.json
 
-The checkpoint contains the backbone, task names, class order, input size, normalization values, and model weights. Use load_classifier_checkpoint from roadforge.classification_training to reconstruct the matching architecture.
+The checkpoint contains the backbone, task names, class order, input size, normalization values, initialization source (including the local checkpoint name and SHA-256 when used), and model weights. Use load_classifier_checkpoint from roadforge.classification_training to reconstruct the matching architecture.
 
 ## 5. Export an AVIS classifier to ONNX
 
