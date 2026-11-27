@@ -120,6 +120,8 @@ def _make_transforms():
 
 
 def _metrics_from_confusions(confusions, tasks):
+    import torch
+
     metrics: dict[str, dict[str, Any]] = {}
     for task, raw_matrix in zip(tasks, confusions):
         matrix = raw_matrix.to(dtype=__import__("torch").float64)
