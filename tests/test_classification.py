@@ -8,6 +8,7 @@ import pytest
 from PIL import Image
 
 from roadforge.classification_data import (
+    analyze_classification_split,
     annotated_samples,
     ensure_dataset,
     import_avis_captures,
@@ -100,6 +101,76 @@ def test_session_split_keeps_each_session_in_one_partition():
             session = row["session_id"]
             assert session not in membership or membership[session] == partition
             membership[session] = partition
+
+
+def test_single_session_uses_chronological_split_with_boundary_embargo():
+    from datetime import datetime, timedelta, timezone
+
+    start = datetime(2026, 11, 1, tzinfo=timezone.utc)
+    samples = []
+    for index in range(100):
+        samples.append({
+            "sample_id": f"frame-{index}",
+            "session_id": "one-long-avis-session",
+            "captured_at": (start + timedelta(seconds=index)).isoformat(),
+            "labels": {
+                "obstacle_ahead": "yes" if index % 2 else "no",
+                "traffic_sign": "stop" if index % 5 == 0 else "no_sign",
+            },
+        })
+
+    split, warning = split_samples(samples, seed=123)
+    assert warning and "chronological" in warning
+    indices = {
+        part: {
+            int(row["sample_id"].removeprefix("frame-"))
+            for row in rows
+        }
+        for part, rows in split.items()
+    }
+    assert all(indices.values())
+    assert not (indices["train"] & indices["val"])
+    assert not (indices["train"] & indices["test"])
+    assert not (indices["val"] & indices["test"])
+    assert max(indices["train"]) < min(indices["val"])
+    assert max(indices["val"]) < min(indices["test"])
+    # The samples touching both same-session boundaries are embargoed.
+    assert min(indices["val"]) - max(indices["train"]) >= 3
+    assert min(indices["test"]) - max(indices["val"]) >= 3
+
+
+def test_session_split_keeps_classes_unique_to_one_session_in_training():
+    samples = []
+    for session in range(5):
+        for frame in range(10):
+            samples.append({
+                "sample_id": f"{session}-{frame}",
+                "session_id": f"session-{session}",
+                "labels": {
+                    "obstacle_ahead": "yes" if frame % 2 else "no",
+                    "traffic_sign": (
+                        "stop" if session == 0 and frame < 2
+                        else "speed_limit" if session > 0 and frame < 2
+                        else "no_sign"
+                    ),
+                },
+            })
+
+    split, audit = analyze_classification_split(samples, validate_tasks(TASKS), seed=7)
+    assert audit["strategy"] == "session_isolated"
+    assert not audit["errors"]
+    train_classes = {
+        row["labels"]["traffic_sign"] for row in split["train"]
+    }
+    assert {"stop", "speed_limit", "no_sign"} <= train_classes
+
+    membership = {}
+    for part, rows in split.items():
+        for row in rows:
+            session = row["session_id"]
+            assert session not in membership or membership[session] == part
+            membership[session] = part
+    assert set(membership.values()) == {"train", "val", "test"}
 
 
 def test_schema_cannot_be_changed_after_annotations_exist(tmp_path):
